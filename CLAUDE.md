@@ -9,7 +9,7 @@ This is an offline audio transcription CLI tool using faster-whisper. The projec
 ## Core Architecture
 
 - **Single-file implementation**: `transcribe.py` contains the entire CLI application
-- **Library**: Uses faster-whisper (4x faster than standard whisper) 
+- **Library**: Uses faster-whisper (4x faster than standard whisper)
 - **Target platform**: macOS Sequoia+ with Metal GPU acceleration
 - **Offline-first**: No internet required after initial model download
 
@@ -20,10 +20,12 @@ This is an offline audio transcription CLI tool using faster-whisper. The projec
 ```
 
 Required arguments:
+
 - `input_file`: Path to audio file
 - `-o, --output`: Output text file path
 
 Optional arguments:
+
 - `--model`: Whisper model size (tiny/base/small/medium/large), defaults to 'base'
 
 ## Key Implementation Requirements
@@ -49,9 +51,17 @@ The tool should handle common audio formats (mp3, wav, m4a) and process files of
 - Document all architecture decisions and changes in `docs/dev/*.md`
 - Refer to docs/dev/ documentation for an architecture overview and summary
 
+### Testing and Validation
+
+- unit tests are available in tests/
+- unit tests are to be created for each step/task of development
+- all unit tests must pass between steps
+
 ## Development Workflow Memories
 
-- add user docs after adding a feature in docs/*.md
+- add user docs after adding a feature in docs/\*.md
 - take it step by step. Generate tests for planned tasks. Use the tests to iterate during each step. Code like a human that iteratively builds up functionality and tests piece by piece.
 - create a plan and present it and/or tasks to get approval before writing or modifying files.
 - use the assets/testing-file for testing with real files
+- always test the functionality between steps
+

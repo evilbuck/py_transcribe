@@ -16,28 +16,32 @@ A command-line tool for transcribing audio files to text using OpenAI's Whisper 
 ## Installation
 
 1. **Install system dependencies:**
+
    ```bash
    # macOS (using Homebrew)
    brew install ffmpeg
-   
+
    # Ubuntu/Debian
    sudo apt update && sudo apt install ffmpeg
-   
+
    # Windows (using Chocolatey)
    choco install ffmpeg
    ```
 
 2. **Install Python dependencies:**
+
    ```bash
    pip install -r requirements.txt
    ```
 
 3. **Make the script executable:**
+
    ```bash
    chmod +x transcribe.py
    ```
 
 4. **Pre-download models (optional but recommended):**
+
    ```python
    python -c "from faster_whisper import WhisperModel; WhisperModel('base')"
    ```
@@ -45,11 +49,13 @@ A command-line tool for transcribing audio files to text using OpenAI's Whisper 
 ## Usage
 
 ### Basic Usage
+
 ```bash
 ./transcribe.py input.mp3 -o output.txt
 ```
 
 ### With Custom Model Size
+
 ```bash
 ./transcribe.py input.wav -o transcript.txt --model small
 ```
@@ -65,13 +71,13 @@ A command-line tool for transcribing audio files to text using OpenAI's Whisper 
 
 ## Model Sizes
 
-| Model  | Size  | Speed | Accuracy |
-|--------|-------|-------|----------|
-| tiny   | 39MB  | Fastest | Lowest |  
-| base   | 74MB  | Fast    | Good   |
-| small  | 244MB | Medium  | Better |
-| medium | 769MB | Slow    | High   |
-| large  | 1550MB| Slowest | Highest|
+| Model  | Size   | Speed   | Accuracy |
+| ------ | ------ | ------- | -------- |
+| tiny   | 39MB   | Fastest | Lowest   |
+| base   | 74MB   | Fast    | Good     |
+| small  | 244MB  | Medium  | Better   |
+| medium | 769MB  | Slow    | High     |
+| large  | 1550MB | Slowest | Highest  |
 
 ## Examples
 
@@ -143,14 +149,17 @@ The tool provides clear error messages for common issues:
 ## Troubleshooting
 
 **Model fails to load:**
+
 - Ensure you have internet connection for initial model download
 - Check available disk space for model cache
 
 **Audio file not recognized:**
+
 - Verify the file format is supported
 - Check file permissions and path
 
 **Slow performance:**
+
 - Try a smaller model size (tiny, base, small)
 - Ensure Metal GPU acceleration is available on macOS
 
@@ -158,6 +167,7 @@ The tool provides clear error messages for common issues:
 
 Run the test suite to verify functionality:
 
-```bash
+````bash
 python -m pytest tests/ -v
 ```# py_transcribe
+````
