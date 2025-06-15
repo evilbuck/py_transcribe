@@ -133,22 +133,83 @@ def get_optimal_thread_count(user_threads=None):
     return optimal_threads
 
 
+def detect_device_capabilities():
+    """Detect and report GPU/device capabilities for optimal performance"""
+    import platform
+    
+    capabilities = {
+        'platform': platform.system(),
+        'machine': platform.machine(),
+        'has_mps': False,
+        'has_cuda': False,
+        'gpu_memory_mb': 0,
+        'recommended_device': 'cpu',
+        'recommended_compute_type': 'float32'
+    }
+    
+    # Check for PyTorch MPS (Metal Performance Shaders) support
+    try:
+        import torch
+        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            capabilities['has_mps'] = True
+            capabilities['recommended_device'] = 'auto'  # Let faster-whisper auto-detect Metal
+            # For M-series chips with MPS, use float32 for stability initially
+            # Can be optimized to float16 later if testing shows it's stable
+            if platform.system() == "Darwin" and platform.machine() == "arm64":
+                capabilities['recommended_compute_type'] = 'float32'
+    except ImportError:
+        pass
+    
+    # Check for CUDA support
+    try:
+        import torch
+        if torch.cuda.is_available():
+            capabilities['has_cuda'] = True
+            capabilities['recommended_device'] = 'cuda'
+            capabilities['gpu_memory_mb'] = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+            capabilities['recommended_compute_type'] = 'float16'
+    except (ImportError, AssertionError):
+        pass
+    
+    # Fallback compute type selection
+    if not capabilities['has_mps'] and not capabilities['has_cuda']:
+        capabilities['recommended_compute_type'] = 'float32'  # Safer for CPU
+    
+    return capabilities
+
+
 def get_optimal_compute_type():
     """Determine optimal compute type to avoid warnings"""
-    try:
-        from faster_whisper import WhisperModel
-        import platform
-        
-        # On macOS with Apple Silicon, float32 is generally more stable
-        if platform.system() == "Darwin" and platform.machine() == "arm64":
-            return "float32"
-        
-        # For other systems, let the library auto-detect but bias toward float32
-        # to avoid the frequent float16 conversion warnings
-        return "float32"
-        
-    except ImportError:
-        return "auto"
+    capabilities = detect_device_capabilities()
+    return capabilities['recommended_compute_type']
+
+
+def get_optimal_device():
+    """Determine optimal device for faster-whisper"""
+    capabilities = detect_device_capabilities()
+    return capabilities['recommended_device']
+
+
+def report_device_capabilities(capabilities=None):
+    """Report detected device capabilities to user"""
+    if capabilities is None:
+        capabilities = detect_device_capabilities()
+    
+    print(f"🖥️  System: {capabilities['platform']} {capabilities['machine']}")
+    
+    if capabilities['has_mps']:
+        print("⚡ Metal Performance Shaders (MPS): Available")
+        print(f"🎯 Using GPU acceleration for faster transcription")
+    elif capabilities['has_cuda']:
+        print(f"⚡ CUDA GPU: Available ({capabilities['gpu_memory_mb']} MB)")
+        print(f"🎯 Using GPU acceleration for faster transcription")
+    else:
+        print("💻 GPU: Using CPU processing")
+        if capabilities['platform'] == "Darwin" and capabilities['machine'] == "arm64":
+            print("💡 Tip: Install PyTorch with MPS support for 2-4x speedup")
+    
+    print(f"⚙️  Device: {capabilities['recommended_device']}, Compute: {capabilities['recommended_compute_type']}")
+    print()
 
 
 def create_audio_chunks(input_file, chunk_duration_minutes, temp_dir):
@@ -204,12 +265,11 @@ def create_audio_chunks(input_file, chunk_duration_minutes, temp_dir):
         raise RuntimeError(f"Failed to create audio chunks: {e}")
 
 
-def transcribe_chunk(chunk_info, model_size, compute_type="auto"):
+def transcribe_chunk(chunk_info, model_size, device=None, compute_type=None):
     """Transcribe a single audio chunk"""
     try:
-        # Initialize model for this worker thread
-        from faster_whisper import WhisperModel
-        model = WhisperModel(model_size, device="auto", compute_type=compute_type)
+        # Initialize model for this worker thread with optimal settings
+        model = initialize_whisper_model(model_size, device, compute_type)
         
         # Transcribe the chunk
         segments, info = model.transcribe(
@@ -277,7 +337,7 @@ def assemble_transcripts(chunk_results):
     return all_segments, language_info
 
 
-def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duration_minutes, num_threads, compute_type="auto"):
+def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duration_minutes, num_threads, device=None, compute_type=None):
     """Transcribe audio file using parallel chunk processing"""
     temp_dir = None
     try:
@@ -297,7 +357,7 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
             # Submit all chunk transcription tasks
             future_to_chunk = {
-                executor.submit(transcribe_chunk, chunk, model_size, compute_type): chunk
+                executor.submit(transcribe_chunk, chunk, model_size, device, compute_type): chunk
                 for chunk in chunks
             }
             
@@ -353,18 +413,29 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
             shutil.rmtree(temp_dir)
 
 
-def initialize_whisper_model(model_size, compute_type="auto"):
-    """Initialize Whisper model with automatic device selection"""
+def initialize_whisper_model(model_size, device=None, compute_type=None):
+    """Initialize Whisper model with optimal device and compute type selection"""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         raise ImportError("faster-whisper is not installed. Run: pip install faster-whisper")
     
-    print(f"Loading Whisper model '{model_size}'...")
+    # Use optimal device and compute type if not specified
+    if device is None:
+        device = get_optimal_device()
+    if compute_type is None:
+        compute_type = get_optimal_compute_type()
+    
+    print(f"Loading Whisper model '{model_size}' (device: {device}, compute: {compute_type})...")
     start_time = time.time()
     
-    # Use automatic device selection with explicit compute type to avoid warnings
-    model = WhisperModel(model_size, device="auto", compute_type=compute_type)
+    try:
+        # Try optimal configuration first
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    except Exception as e:
+        print(f"⚠️  Falling back to CPU due to: {e}")
+        # Fallback to CPU with safe compute type
+        model = WhisperModel(model_size, device="cpu", compute_type="float32")
     
     load_time = time.time() - start_time
     print(f"✓ Model loaded in {load_time:.1f}s")
@@ -472,12 +543,17 @@ def main():
         output_path = validate_output_path(args.output)
         print(f"✓ Output path validated: {output_path}")
         
+        # Detect and report device capabilities
+        capabilities = detect_device_capabilities()
+        report_device_capabilities(capabilities)
+        
         # Check audio duration to decide on processing method
         duration = get_audio_duration(input_path)
         print(f"✓ Audio duration: {format_time(duration)}")
         
-        # Get optimal compute type to avoid warnings
-        compute_type = get_optimal_compute_type()
+        # Get optimal device and compute settings
+        device = capabilities['recommended_device']
+        compute_type = capabilities['recommended_compute_type']
         
         # Determine processing method
         use_parallel = (
@@ -493,7 +569,7 @@ def main():
             # Process with parallel chunking
             transcribe_audio_parallel(
                 args.model, input_path, output_path, 
-                args.chunk_size, num_threads, compute_type
+                args.chunk_size, num_threads, device, compute_type
             )
         else:
             # Use traditional single-threaded processing
@@ -503,7 +579,7 @@ def main():
                 print("✓ Using sequential processing (file under 30 minutes)")
             
             # Initialize Whisper model
-            model = initialize_whisper_model(args.model, compute_type)
+            model = initialize_whisper_model(args.model, device, compute_type)
             
             # Transcribe audio file
             transcribe_audio(model, input_path, output_path)
