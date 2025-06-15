@@ -16,6 +16,8 @@ import tempfile
 import shutil
 import threading
 from queue import Queue, Empty
+import atexit
+import weakref
 
 
 def parse_arguments():
@@ -27,12 +29,12 @@ def parse_arguments():
     
     parser.add_argument(
         "input_file",
+        nargs="?",  # Make optional for cache-stats and preload commands
         help="Path to the audio file to transcribe"
     )
     
     parser.add_argument(
         "-o", "--output",
-        required=True,
         help="Path for the output text file"
     )
     
@@ -60,6 +62,18 @@ def parse_arguments():
         "--no-parallel",
         action="store_true",
         help="Disable parallel processing even for long files"
+    )
+    
+    parser.add_argument(
+        "--preload",
+        action="store_true",
+        help="Pre-load model for faster subsequent usage"
+    )
+    
+    parser.add_argument(
+        "--cache-stats",
+        action="store_true",
+        help="Show model cache statistics and exit"
     )
     
     return parser.parse_args()
@@ -268,9 +282,10 @@ class ModelPool:
         self.models = Queue(maxsize=pool_size)
         self.lock = threading.Lock()
         self._initialized = False
+        self._use_cache = True  # Enable cache integration
         
     def initialize(self):
-        """Initialize the model pool"""
+        """Initialize the model pool using cached models"""
         if self._initialized:
             return
             
@@ -281,11 +296,21 @@ class ModelPool:
             print(f"📦 Initializing model pool with {self.pool_size} instances...")
             start_time = time.time()
             
+            # Check if we can reuse cached model
+            cache_stats = _global_model_cache.get_cache_stats()
+            cache_key = f"{self.model_size}_{self.device}_{self.compute_type}"
+            
+            if cache_stats['cached_models'] > 0:
+                print(f"🔄 Leveraging cached model for pool initialization...")
+            
             for i in range(self.pool_size):
                 try:
-                    model = initialize_whisper_model(self.model_size, self.device, self.compute_type)
+                    # Use cached model for faster pool initialization
+                    model = initialize_whisper_model(
+                        self.model_size, self.device, self.compute_type, use_cache=self._use_cache
+                    )
                     self.models.put(model)
-                    print(f"✓ Model {i+1}/{self.pool_size} loaded")
+                    print(f"✓ Model {i+1}/{self.pool_size} ready")
                 except Exception as e:
                     print(f"⚠️  Failed to load model {i+1}: {e}")
                     # Put None as placeholder to maintain pool size
@@ -426,6 +451,144 @@ def get_optimal_transcription_params(device_capabilities, model_size="base"):
         params['vad_parameters'] = dict(min_silence_duration_ms=1500)
     
     return params
+
+
+class GlobalModelCache:
+    """Global cache for Whisper models to avoid repeated loading"""
+    
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+        self._access_count = {}
+        self._last_access = {}
+        
+        # Register cleanup on exit
+        atexit.register(self.cleanup_all)
+    
+    def _get_cache_key(self, model_size, device, compute_type):
+        """Generate cache key for model configuration"""
+        return f"{model_size}_{device}_{compute_type}"
+    
+    def get_model(self, model_size, device="auto", compute_type="auto"):
+        """Get model from cache or create new one"""
+        cache_key = self._get_cache_key(model_size, device, compute_type)
+        
+        with self._lock:
+            if cache_key in self._cache:
+                model = self._cache[cache_key]
+                if model is not None:
+                    # Update access tracking
+                    self._access_count[cache_key] = self._access_count.get(cache_key, 0) + 1
+                    self._last_access[cache_key] = time.time()
+                    print(f"📦 Using cached model '{model_size}' (accessed {self._access_count[cache_key]} times)")
+                    return model
+            
+            # Model not in cache or invalid, create new one
+            print(f"🔄 Loading and caching model '{model_size}'...")
+            start_time = time.time()
+            
+            try:
+                model = self._create_model(model_size, device, compute_type)
+                self._cache[cache_key] = model
+                self._access_count[cache_key] = 1
+                self._last_access[cache_key] = time.time()
+                
+                load_time = time.time() - start_time
+                print(f"✓ Model cached in {load_time:.1f}s")
+                return model
+                
+            except Exception as e:
+                print(f"⚠️  Failed to cache model: {e}")
+                # Don't cache failed models
+                return self._create_model(model_size, device, compute_type)
+    
+    def _create_model(self, model_size, device, compute_type):
+        """Create a new model instance"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise ImportError("faster-whisper is not installed. Run: pip install faster-whisper")
+        
+        try:
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            return model
+        except Exception as e:
+            print(f"⚠️  Falling back to CPU due to: {e}")
+            return WhisperModel(model_size, device="cpu", compute_type="float32")
+    
+    def preload_model(self, model_size, device="auto", compute_type="auto"):
+        """Preload a model for faster access later"""
+        cache_key = self._get_cache_key(model_size, device, compute_type)
+        
+        with self._lock:
+            if cache_key not in self._cache:
+                print(f"🚀 Pre-warming model '{model_size}'...")
+                self.get_model(model_size, device, compute_type)
+    
+    def get_cache_stats(self):
+        """Get cache statistics"""
+        with self._lock:
+            return {
+                'cached_models': len(self._cache),
+                'total_accesses': sum(self._access_count.values()),
+                'models': {k: {'accesses': self._access_count.get(k, 0), 
+                              'last_access': self._last_access.get(k, 0)} 
+                          for k in self._cache.keys()}
+            }
+    
+    def cleanup_old_models(self, max_age_seconds=3600):
+        """Clean up models that haven't been accessed recently"""
+        current_time = time.time()
+        to_remove = []
+        
+        with self._lock:
+            for cache_key, last_access in self._last_access.items():
+                if current_time - last_access > max_age_seconds:
+                    to_remove.append(cache_key)
+            
+            for cache_key in to_remove:
+                if cache_key in self._cache:
+                    print(f"🧹 Cleaning up old model: {cache_key}")
+                    del self._cache[cache_key]
+                    del self._access_count[cache_key]
+                    del self._last_access[cache_key]
+    
+    def cleanup_all(self):
+        """Clean up all cached models"""
+        with self._lock:
+            self._cache.clear()
+            self._access_count.clear()
+            self._last_access.clear()
+
+
+# Global model cache instance
+_global_model_cache = GlobalModelCache()
+
+
+def preload_model_for_config(model_size, device=None, compute_type=None):
+    """Preload a model based on system configuration for faster startup"""
+    if device is None:
+        device = get_optimal_device()
+    if compute_type is None:
+        compute_type = get_optimal_compute_type()
+    
+    print(f"🚀 Pre-loading model '{model_size}' for faster startup...")
+    _global_model_cache.preload_model(model_size, device, compute_type)
+
+
+def get_model_cache_stats():
+    """Get current model cache statistics"""
+    return _global_model_cache.get_cache_stats()
+
+
+def suggest_model_preload(device_capabilities, model_size="base"):
+    """Suggest whether to preload models based on system capabilities"""
+    # For GPU systems with good performance, preloading is beneficial
+    if device_capabilities.get('has_mps') or device_capabilities.get('has_cuda'):
+        return True
+    
+    # For CPU systems, preloading might not be worth the startup cost
+    return False
 
 
 def report_device_capabilities(capabilities=None):
@@ -667,6 +830,12 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
         transcription_params = get_optimal_transcription_params(capabilities, model_size)
         print(f"🎯 Optimized parameters: beam_size={transcription_params['beam_size']}, VAD threshold={transcription_params['vad_parameters']['min_silence_duration_ms']}ms")
         
+        # Pre-warm the model cache if beneficial (before creating pool)
+        cache_stats = get_model_cache_stats()
+        if cache_stats['cached_models'] == 0 and suggest_model_preload(capabilities, model_size):
+            print("🚀 Pre-warming model cache for parallel processing...")
+            preload_model_for_config(model_size, device, compute_type)
+        
         # Initialize model pool for efficient GPU utilization
         # Use smaller pool size to avoid memory exhaustion
         pool_size = min(num_threads, 3)  # Limit to 3 models max for GPU efficiency
@@ -740,34 +909,39 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
             shutil.rmtree(temp_dir)
 
 
-def initialize_whisper_model(model_size, device=None, compute_type=None):
+def initialize_whisper_model(model_size, device=None, compute_type=None, use_cache=True):
     """Initialize Whisper model with optimal device and compute type selection"""
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError:
-        raise ImportError("faster-whisper is not installed. Run: pip install faster-whisper")
-    
     # Use optimal device and compute type if not specified
     if device is None:
         device = get_optimal_device()
     if compute_type is None:
         compute_type = get_optimal_compute_type()
     
-    print(f"Loading Whisper model '{model_size}' (device: {device}, compute: {compute_type})...")
-    start_time = time.time()
-    
-    try:
-        # Try optimal configuration first
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    except Exception as e:
-        print(f"⚠️  Falling back to CPU due to: {e}")
-        # Fallback to CPU with safe compute type
-        model = WhisperModel(model_size, device="cpu", compute_type="float32")
-    
-    load_time = time.time() - start_time
-    print(f"✓ Model loaded in {load_time:.1f}s")
-    
-    return model
+    if use_cache:
+        # Use global model cache for faster access
+        return _global_model_cache.get_model(model_size, device, compute_type)
+    else:
+        # Direct model creation (for legacy compatibility)
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise ImportError("faster-whisper is not installed. Run: pip install faster-whisper")
+        
+        print(f"Loading Whisper model '{model_size}' (device: {device}, compute: {compute_type})...")
+        start_time = time.time()
+        
+        try:
+            # Try optimal configuration first
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        except Exception as e:
+            print(f"⚠️  Falling back to CPU due to: {e}")
+            # Fallback to CPU with safe compute type
+            model = WhisperModel(model_size, device="cpu", compute_type="float32")
+        
+        load_time = time.time() - start_time
+        print(f"✓ Model loaded in {load_time:.1f}s")
+        
+        return model
 
 
 def format_time(seconds):
@@ -868,6 +1042,38 @@ def main():
     try:
         args = parse_arguments()
         
+        # Handle cache stats option
+        if args.cache_stats:
+            stats = get_model_cache_stats()
+            print("📊 Model Cache Statistics:")
+            print(f"   Cached models: {stats['cached_models']}")
+            print(f"   Total accesses: {stats['total_accesses']}")
+            if stats['models']:
+                print("   Model details:")
+                for model_key, details in stats['models'].items():
+                    print(f"     {model_key}: {details['accesses']} accesses")
+            else:
+                print("   No models currently cached")
+            return 0
+        
+        # Detect and report device capabilities early
+        capabilities = detect_device_capabilities()
+        report_device_capabilities(capabilities)
+        
+        # Handle preload option
+        if args.preload:
+            preload_model_for_config(args.model)
+            print(f"✓ Model '{args.model}' pre-loaded and cached")
+            return 0
+        
+        # Validate required arguments for transcription
+        if not args.input_file:
+            print("Error: input_file is required for transcription", file=sys.stderr)
+            return 1
+        if not args.output:
+            print("Error: -o/--output is required for transcription", file=sys.stderr)
+            return 1
+        
         # Validate input file
         input_path = validate_input_file(args.input_file)
         print(f"✓ Input file validated: {input_path}")
@@ -875,10 +1081,6 @@ def main():
         # Validate output path
         output_path = validate_output_path(args.output)
         print(f"✓ Output path validated: {output_path}")
-        
-        # Detect and report device capabilities
-        capabilities = detect_device_capabilities()
-        report_device_capabilities(capabilities)
         
         # Check audio duration to decide on processing method
         duration = get_audio_duration(input_path)
@@ -922,7 +1124,12 @@ def main():
             transcription_params = get_optimal_transcription_params(capabilities, args.model)
             print(f"🎯 Optimized parameters: beam_size={transcription_params['beam_size']}, VAD threshold={transcription_params['vad_parameters']['min_silence_duration_ms']}ms")
             
-            # Initialize Whisper model
+            # Check if we should preload for future usage
+            cache_stats = get_model_cache_stats()
+            if cache_stats['cached_models'] == 0 and suggest_model_preload(capabilities, args.model):
+                print("💡 Pre-loading model for future usage...")
+            
+            # Initialize Whisper model (will use cache if available)
             model = initialize_whisper_model(args.model, device, compute_type)
             
             # Transcribe audio file
