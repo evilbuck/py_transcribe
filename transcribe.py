@@ -14,6 +14,8 @@ import multiprocessing
 import concurrent.futures
 import tempfile
 import shutil
+import threading
+from queue import Queue, Empty
 
 
 def parse_arguments():
@@ -190,6 +192,242 @@ def get_optimal_device():
     return capabilities['recommended_device']
 
 
+def get_gpu_memory_info():
+    """Get GPU memory information for optimization"""
+    memory_info = {
+        'total_mb': 0,
+        'available_mb': 0,
+        'has_unified_memory': False
+    }
+    
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            # M-series chips have unified memory architecture
+            memory_info['has_unified_memory'] = True
+            # For M-series, we estimate based on system memory
+            # since GPU and CPU share unified memory
+            try:
+                import psutil
+                total_ram = psutil.virtual_memory().total // (1024 * 1024)
+                # Estimate 60% of system RAM is available for GPU tasks
+                memory_info['total_mb'] = int(total_ram * 0.6)
+                memory_info['available_mb'] = int(total_ram * 0.4)  # Conservative estimate
+            except ImportError:
+                # Fallback estimates for M4 (typical configs)
+                memory_info['total_mb'] = 12288  # 12GB estimate
+                memory_info['available_mb'] = 8192   # 8GB conservative
+        elif torch.cuda.is_available():
+            # CUDA GPU memory
+            device = torch.cuda.current_device()
+            properties = torch.cuda.get_device_properties(device)
+            memory_info['total_mb'] = properties.total_memory // (1024 * 1024)
+            memory_info['available_mb'] = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
+    except ImportError:
+        pass
+    
+    return memory_info
+
+
+def calculate_optimal_chunk_size(duration_seconds, num_threads, gpu_memory_mb, default_minutes=10):
+    """Calculate optimal chunk size based on GPU memory and file duration"""
+    
+    # Base chunk size in minutes
+    optimal_minutes = default_minutes
+    
+    if gpu_memory_mb > 0:
+        # Estimate memory usage per model instance (base model ~500MB)
+        model_memory_mb = 500
+        total_model_memory = model_memory_mb * num_threads
+        
+        # If we have plenty of GPU memory, we can use larger chunks
+        if gpu_memory_mb >= total_model_memory * 2:
+            # Abundant memory: use larger chunks for efficiency
+            optimal_minutes = min(20, default_minutes * 2)
+        elif gpu_memory_mb < total_model_memory * 1.5:
+            # Constrained memory: use smaller chunks
+            optimal_minutes = max(5, default_minutes // 2)
+        
+        # For very long files, adjust chunk size to balance parallelism
+        duration_hours = duration_seconds / 3600
+        if duration_hours > 3:  # Very long files (>3 hours)
+            # Use slightly larger chunks to reduce overhead
+            optimal_minutes = min(15, optimal_minutes * 1.5)
+    
+    return int(optimal_minutes)
+
+
+class ModelPool:
+    """Pool of Whisper models for efficient parallel processing"""
+    
+    def __init__(self, model_size, device, compute_type, pool_size):
+        self.model_size = model_size
+        self.device = device
+        self.compute_type = compute_type
+        self.pool_size = pool_size
+        self.models = Queue(maxsize=pool_size)
+        self.lock = threading.Lock()
+        self._initialized = False
+        
+    def initialize(self):
+        """Initialize the model pool"""
+        if self._initialized:
+            return
+            
+        with self.lock:
+            if self._initialized:
+                return
+                
+            print(f"📦 Initializing model pool with {self.pool_size} instances...")
+            start_time = time.time()
+            
+            for i in range(self.pool_size):
+                try:
+                    model = initialize_whisper_model(self.model_size, self.device, self.compute_type)
+                    self.models.put(model)
+                    print(f"✓ Model {i+1}/{self.pool_size} loaded")
+                except Exception as e:
+                    print(f"⚠️  Failed to load model {i+1}: {e}")
+                    # Put None as placeholder to maintain pool size
+                    self.models.put(None)
+            
+            load_time = time.time() - start_time
+            print(f"✓ Model pool initialized in {load_time:.1f}s")
+            self._initialized = True
+    
+    def get_model(self, timeout=30):
+        """Get a model from the pool"""
+        try:
+            model = self.models.get(timeout=timeout)
+            if model is None:
+                # Fallback: create a new model if pool had failures
+                model = initialize_whisper_model(self.model_size, self.device, self.compute_type)
+            return model
+        except Empty:
+            # Emergency fallback: create new model if pool is exhausted
+            print("⚠️  Model pool exhausted, creating temporary model")
+            return initialize_whisper_model(self.model_size, self.device, self.compute_type)
+    
+    def return_model(self, model):
+        """Return a model to the pool"""
+        try:
+            self.models.put_nowait(model)
+        except:
+            # Pool is full, model will be garbage collected
+            pass
+    
+    def cleanup(self):
+        """Clean up all models in the pool"""
+        while not self.models.empty():
+            try:
+                model = self.models.get_nowait()
+                if model is not None:
+                    del model
+            except Empty:
+                break
+
+
+def monitor_system_resources():
+    """Monitor system resources for optimization feedback"""
+    resource_info = {
+        'cpu_percent': 0,
+        'memory_percent': 0,
+        'memory_available_gb': 0
+    }
+    
+    try:
+        import psutil
+        resource_info['cpu_percent'] = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+        resource_info['memory_percent'] = memory.percent
+        resource_info['memory_available_gb'] = memory.available / (1024**3)
+    except ImportError:
+        pass
+    
+    return resource_info
+
+
+def optimize_thread_count_for_gpu(requested_threads, gpu_memory_mb, model_size="base"):
+    """Optimize thread count based on GPU memory constraints"""
+    
+    # Estimate memory usage per model instance
+    model_memory_estimates = {
+        "tiny": 150,   # MB
+        "base": 500,   # MB  
+        "small": 1000, # MB
+        "medium": 2500, # MB
+        "large": 4500   # MB
+    }
+    
+    model_memory_mb = model_memory_estimates.get(model_size, 500)
+    
+    if gpu_memory_mb > 0:
+        # Calculate max threads based on available GPU memory
+        # Leave 2GB buffer for system and other processes
+        available_memory = max(0, gpu_memory_mb - 2048)
+        max_threads_by_memory = max(1, available_memory // model_memory_mb)
+        
+        # Don't exceed requested threads, but warn if memory constrained
+        optimal_threads = min(requested_threads, max_threads_by_memory)
+        
+        if optimal_threads < requested_threads:
+            print(f"⚠️  GPU memory constraint: Using {optimal_threads} threads instead of {requested_threads}")
+            print(f"   Model memory: ~{model_memory_mb}MB x {requested_threads} = {model_memory_mb * requested_threads}MB")
+            print(f"   Available GPU memory: ~{gpu_memory_mb}MB")
+        
+        return optimal_threads
+    
+    return requested_threads
+
+
+def get_optimal_transcription_params(device_capabilities, model_size="base"):
+    """Get optimal transcription parameters for the detected hardware"""
+    params = {
+        'beam_size': 5,
+        'vad_filter': True,
+        'vad_parameters': dict(min_silence_duration_ms=1000),
+        'temperature': 0,
+        'compression_ratio_threshold': 2.4,
+        'no_speech_threshold': 0.6
+    }
+    
+    # Optimize for M4 GPU
+    if device_capabilities.get('has_mps'):
+        # M4 optimizations
+        if model_size in ['tiny', 'base']:
+            # Smaller models can handle larger beam size efficiently
+            params['beam_size'] = 8
+        elif model_size == 'small':
+            params['beam_size'] = 6
+        else:
+            # Larger models: reduce beam size to maintain speed
+            params['beam_size'] = 4
+            
+        # Optimize VAD for longer files (more aggressive silence detection)
+        params['vad_parameters'] = dict(
+            min_silence_duration_ms=500,  # More aggressive
+            speech_pad_ms=400
+        )
+        
+        # Lower temperature for more consistent results on GPU
+        params['temperature'] = 0.1
+        
+    # Optimize for CUDA
+    elif device_capabilities.get('has_cuda'):
+        # CUDA can handle larger beam sizes well
+        params['beam_size'] = min(10, params['beam_size'] + 2)
+        params['temperature'] = 0.2
+        
+    # CPU optimizations (conservative settings)
+    else:
+        # Reduce beam size for CPU to maintain speed
+        params['beam_size'] = max(3, params['beam_size'] - 1)
+        # Less aggressive VAD on CPU
+        params['vad_parameters'] = dict(min_silence_duration_ms=1500)
+    
+    return params
+
+
 def report_device_capabilities(capabilities=None):
     """Report detected device capabilities to user"""
     if capabilities is None:
@@ -197,8 +435,13 @@ def report_device_capabilities(capabilities=None):
     
     print(f"🖥️  System: {capabilities['platform']} {capabilities['machine']}")
     
+    # Get GPU memory info for detailed reporting
+    memory_info = get_gpu_memory_info()
+    
     if capabilities['has_mps']:
         print("⚡ Metal Performance Shaders (MPS): Available")
+        if memory_info['has_unified_memory']:
+            print(f"🧠 Unified Memory: ~{memory_info['available_mb']//1024}GB available for GPU tasks")
         print(f"🎯 Using GPU acceleration for faster transcription")
     elif capabilities['has_cuda']:
         print(f"⚡ CUDA GPU: Available ({capabilities['gpu_memory_mb']} MB)")
@@ -265,8 +508,61 @@ def create_audio_chunks(input_file, chunk_duration_minutes, temp_dir):
         raise RuntimeError(f"Failed to create audio chunks: {e}")
 
 
+def transcribe_chunk_with_pool(chunk_info, model_pool, transcription_params=None):
+    """Transcribe a single audio chunk using model pool"""
+    model = None
+    try:
+        # Get model from pool
+        model = model_pool.get_model()
+        
+        # Use optimized parameters if provided, otherwise use defaults
+        if transcription_params is None:
+            transcription_params = {
+                'beam_size': 5,
+                'vad_filter': True,
+                'vad_parameters': dict(min_silence_duration_ms=1000)
+            }
+        
+        # Transcribe the chunk with optimized parameters
+        segments, info = model.transcribe(
+            str(chunk_info['file']),
+            **transcription_params
+        )
+        
+        # Collect all segments with adjusted timestamps
+        chunk_segments = []
+        for segment in segments:
+            # Adjust timestamps to reflect position in original file
+            adjusted_segment = {
+                'start': segment.start + chunk_info['start_time'],
+                'end': segment.end + chunk_info['start_time'],
+                'text': segment.text.strip()
+            }
+            chunk_segments.append(adjusted_segment)
+        
+        result = {
+            'chunk_index': chunk_info['index'],
+            'segments': chunk_segments,
+            'language': info.language,
+            'language_probability': info.language_probability
+        }
+        
+        return result
+        
+    except Exception as e:
+        return {
+            'chunk_index': chunk_info['index'],
+            'error': str(e),
+            'segments': []
+        }
+    finally:
+        # Always return model to pool
+        if model is not None:
+            model_pool.return_model(model)
+
+
 def transcribe_chunk(chunk_info, model_size, device=None, compute_type=None):
-    """Transcribe a single audio chunk"""
+    """Transcribe a single audio chunk (legacy function for backward compatibility)"""
     try:
         # Initialize model for this worker thread with optimal settings
         model = initialize_whisper_model(model_size, device, compute_type)
@@ -338,26 +634,53 @@ def assemble_transcripts(chunk_results):
 
 
 def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duration_minutes, num_threads, device=None, compute_type=None):
-    """Transcribe audio file using parallel chunk processing"""
+    """Transcribe audio file using parallel chunk processing with model pooling"""
     temp_dir = None
+    model_pool = None
+    
     try:
         # Create temporary directory for chunks
         temp_dir = tempfile.mkdtemp(prefix="whisper_chunks_")
         
+        # Get GPU memory info for optimization
+        memory_info = get_gpu_memory_info()
+        
+        # Calculate optimal chunk size based on system capabilities
+        duration = get_audio_duration(input_path)
+        optimal_chunk_size = calculate_optimal_chunk_size(
+            duration, num_threads, memory_info['available_mb'], chunk_duration_minutes
+        )
+        
         print(f"Using {num_threads} threads for parallel processing")
-        print(f"Chunk size: {chunk_duration_minutes} minutes")
+        print(f"Optimal chunk size: {optimal_chunk_size} minutes (requested: {chunk_duration_minutes})")
+        if memory_info['has_unified_memory']:
+            print(f"🧠 GPU Memory: ~{memory_info['available_mb']//1024}GB unified memory available")
+        
+        # Use optimal chunk size
+        final_chunk_size = optimal_chunk_size
         
         # Create audio chunks
-        chunks = create_audio_chunks(input_path, chunk_duration_minutes, temp_dir)
+        chunks = create_audio_chunks(input_path, final_chunk_size, temp_dir)
+        
+        # Get optimized transcription parameters for this hardware
+        capabilities = detect_device_capabilities()
+        transcription_params = get_optimal_transcription_params(capabilities, model_size)
+        print(f"🎯 Optimized parameters: beam_size={transcription_params['beam_size']}, VAD threshold={transcription_params['vad_parameters']['min_silence_duration_ms']}ms")
+        
+        # Initialize model pool for efficient GPU utilization
+        # Use smaller pool size to avoid memory exhaustion
+        pool_size = min(num_threads, 3)  # Limit to 3 models max for GPU efficiency
+        model_pool = ModelPool(model_size, device, compute_type, pool_size)
+        model_pool.initialize()
         
         print(f"\nProcessing {len(chunks)} chunks in parallel...")
         start_time = time.time()
         
-        # Process chunks in parallel
+        # Process chunks in parallel using model pool
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
             # Submit all chunk transcription tasks
             future_to_chunk = {
-                executor.submit(transcribe_chunk, chunk, model_size, device, compute_type): chunk
+                executor.submit(transcribe_chunk_with_pool, chunk, model_pool, transcription_params): chunk
                 for chunk in chunks
             }
             
@@ -408,6 +731,10 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
         print(f"  Output saved to: {output_path}")
         
     finally:
+        # Clean up model pool
+        if model_pool:
+            model_pool.cleanup()
+        
         # Clean up temporary directory
         if temp_dir and Path(temp_dir).exists():
             shutil.rmtree(temp_dir)
@@ -465,17 +792,23 @@ def create_progress_bar(percentage, width=40):
     return f"[{bar}]"
 
 
-def transcribe_audio(model, input_path, output_path):
+def transcribe_audio(model, input_path, output_path, transcription_params=None):
     """Transcribe audio file using Whisper model with streaming segments"""
     print(f"Transcribing audio: {input_path.name}")
     start_time = time.time()
     
+    # Use optimized parameters if provided, otherwise use defaults
+    if transcription_params is None:
+        transcription_params = {
+            'beam_size': 5,
+            'vad_filter': True,
+            'vad_parameters': dict(min_silence_duration_ms=1000)
+        }
+    
     # Use streaming segments for memory efficiency with large files
     segments, info = model.transcribe(
         str(input_path),
-        beam_size=5,
-        vad_filter=True,  # Voice Activity Detection to skip silence
-        vad_parameters=dict(min_silence_duration_ms=1000)
+        **transcription_params
     )
     
     print(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
@@ -562,8 +895,15 @@ def main():
         )
         
         if use_parallel:
-            # Get thread count
-            num_threads = get_optimal_thread_count(args.threads)
+            # Get thread count and optimize for GPU memory
+            initial_threads = get_optimal_thread_count(args.threads)
+            memory_info = get_gpu_memory_info()
+            
+            # Optimize thread count based on GPU memory constraints
+            num_threads = optimize_thread_count_for_gpu(
+                initial_threads, memory_info['available_mb'], args.model
+            )
+            
             print(f"✓ Using parallel processing ({num_threads} threads)")
             
             # Process with parallel chunking
@@ -578,11 +918,15 @@ def main():
             else:
                 print("✓ Using sequential processing (file under 30 minutes)")
             
+            # Get optimized transcription parameters
+            transcription_params = get_optimal_transcription_params(capabilities, args.model)
+            print(f"🎯 Optimized parameters: beam_size={transcription_params['beam_size']}, VAD threshold={transcription_params['vad_parameters']['min_silence_duration_ms']}ms")
+            
             # Initialize Whisper model
             model = initialize_whisper_model(args.model, device, compute_type)
             
             # Transcribe audio file
-            transcribe_audio(model, input_path, output_path)
+            transcribe_audio(model, input_path, output_path, transcription_params)
         
         return 0
         
