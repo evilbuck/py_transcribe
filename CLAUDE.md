@@ -56,6 +56,7 @@ The tool should handle common audio formats (mp3, wav, m4a) and process files of
 - unit tests are available in tests/
 - unit tests are to be created for each step/task of development
 - all unit tests must pass between steps
+- use the -tm cli option to create a temporary, shorter audio file for testing purposes. Utilize the option to use shorter chunks for testing. 2 minutes is a good length for testing.
 
 ## Development Workflow Memories
 

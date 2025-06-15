@@ -2,9 +2,13 @@
 """
 Offline Audio Transcriber - Command-line tool for transcribing audio files using faster-whisper
 """
+import os
+# Fix multiprocessing issues that can cause hangs
+os.environ['TORCH_MULTIPROCESSING_SHARING_STRATEGY'] = 'file_system'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import argparse
 import sys
-import os
 from pathlib import Path
 import time
 import math
@@ -19,6 +23,323 @@ from queue import Queue, Empty
 import atexit
 import weakref
 import platform
+
+
+# Configuration file management
+CONFIG_DIR = Path.home() / '.transcribe'
+CONFIG_FILE = CONFIG_DIR / 'config.json'
+
+
+class SystemInfoAdapter:
+    """Adapter pattern for system information detection across different OS"""
+    
+    def __init__(self):
+        self.os_name = platform.system()
+        self.machine = platform.machine()
+    
+    def get_system_memory_gb(self):
+        """Get system memory in GB using OS-specific methods"""
+        try:
+            # Try psutil first (universal)
+            import psutil
+            return psutil.virtual_memory().total // (1024**3)
+        except ImportError:
+            # Fall back to OS-specific detection
+            return self._get_memory_os_specific()
+    
+    def _get_memory_os_specific(self):
+        """OS-specific memory detection"""
+        if self.os_name == 'Darwin':
+            return self._get_memory_macos()
+        elif self.os_name == 'Linux':
+            return self._get_memory_linux()
+        elif self.os_name == 'Windows':
+            return self._get_memory_windows()
+        else:
+            print(f"⚠️  Unsupported OS: {self.os_name}, using 16GB default")
+            return 16
+    
+    def _get_memory_macos(self):
+        """Get memory on macOS using sysctl"""
+        try:
+            result = subprocess.run(['sysctl', '-n', 'hw.memsize'], 
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                mem_bytes = int(result.stdout.strip())
+                return mem_bytes // (1024**3)
+        except Exception as e:
+            print(f"⚠️  macOS memory detection failed: {e}")
+        return 16  # Conservative default
+    
+    def _get_memory_linux(self):
+        """Get memory on Linux using /proc/meminfo"""
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemTotal:'):
+                        mem_kb = int(line.split()[1])
+                        return mem_kb // (1024**2)
+        except Exception as e:
+            print(f"⚠️  Linux memory detection failed: {e}")
+        return 16  # Conservative default
+    
+    def _get_memory_windows(self):
+        """Get memory on Windows using wmic"""
+        try:
+            result = subprocess.run(['wmic', 'computersystem', 'get', 'TotalPhysicalMemory', '/value'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'TotalPhysicalMemory=' in line:
+                        mem_bytes = int(line.split('=')[1])
+                        return mem_bytes // (1024**3)
+        except Exception as e:
+            print(f"⚠️  Windows memory detection failed: {e}")
+        return 16  # Conservative default
+    
+    def get_cpu_count(self):
+        """Get CPU core count"""
+        try:
+            return multiprocessing.cpu_count()
+        except:
+            return 8  # Conservative default
+    
+    def get_cpu_info(self):
+        """Get CPU information using OS-specific methods"""
+        if self.os_name == 'Darwin':
+            return self._get_cpu_info_macos()
+        elif self.os_name == 'Linux':
+            return self._get_cpu_info_linux()
+        elif self.os_name == 'Windows':
+            return self._get_cpu_info_windows()
+        else:
+            return {'brand': 'Unknown', 'performance_cores': 0, 'efficiency_cores': 0}
+    
+    def _get_cpu_info_macos(self):
+        """Get CPU info on macOS"""
+        info = {'brand': '', 'performance_cores': 0, 'efficiency_cores': 0}
+        
+        try:
+            # Get CPU brand
+            result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], 
+                                  capture_output=True, text=True, timeout=2)
+            if result.returncode == 0:
+                info['brand'] = result.stdout.strip()
+            
+            # Get performance cores (Apple Silicon specific)
+            if self.machine == 'arm64':
+                perf_result = subprocess.run(['sysctl', '-n', 'hw.perflevel0.physicalcpu'], 
+                                           capture_output=True, text=True, timeout=2)
+                if perf_result.returncode == 0:
+                    info['performance_cores'] = int(perf_result.stdout.strip())
+                
+                eff_result = subprocess.run(['sysctl', '-n', 'hw.perflevel1.physicalcpu'], 
+                                          capture_output=True, text=True, timeout=2)
+                if eff_result.returncode == 0:
+                    info['efficiency_cores'] = int(eff_result.stdout.strip())
+        except Exception as e:
+            print(f"⚠️  macOS CPU detection failed: {e}")
+        
+        return info
+    
+    def _get_cpu_info_linux(self):
+        """Get CPU info on Linux"""
+        info = {'brand': '', 'performance_cores': 0, 'efficiency_cores': 0}
+        
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('model name'):
+                        info['brand'] = line.split(':', 1)[1].strip()
+                        break
+        except Exception as e:
+            print(f"⚠️  Linux CPU detection failed: {e}")
+        
+        return info
+    
+    def _get_cpu_info_windows(self):
+        """Get CPU info on Windows"""
+        info = {'brand': '', 'performance_cores': 0, 'efficiency_cores': 0}
+        
+        try:
+            result = subprocess.run(['wmic', 'cpu', 'get', 'name', '/value'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Name=' in line:
+                        info['brand'] = line.split('=', 1)[1].strip()
+                        break
+        except Exception as e:
+            print(f"⚠️  Windows CPU detection failed: {e}")
+        
+        return info
+    
+    def has_gpu_acceleration(self):
+        """Check for GPU acceleration capabilities"""
+        if self.os_name == 'Darwin' and self.machine == 'arm64':
+            return {'has_mps': True, 'has_cuda': False, 'gpu_name': 'Apple Silicon GPU'}
+        else:
+            # Try to detect CUDA (simplified check)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device_props = torch.cuda.get_device_properties(0)
+                    return {
+                        'has_mps': False, 
+                        'has_cuda': True, 
+                        'gpu_name': device_props.name
+                    }
+            except:
+                pass
+            
+            return {'has_mps': False, 'has_cuda': False, 'gpu_name': None}
+    
+    def get_system_capabilities(self):
+        """Get complete system capabilities"""
+        memory_gb = self.get_system_memory_gb()
+        cpu_info = self.get_cpu_info()
+        gpu_info = self.has_gpu_acceleration()
+        
+        print(f"✓ Detected {memory_gb}GB system memory")
+        if cpu_info['brand']:
+            print(f"✓ CPU: {cpu_info['brand']}")
+        
+        capabilities = {
+            'platform': self.os_name,
+            'machine': self.machine,
+            'system_memory_gb': memory_gb,
+            'cpu_count': self.get_cpu_count(),
+            'cpu_brand': cpu_info['brand'],
+            'performance_cores': cpu_info['performance_cores'],
+            'efficiency_cores': cpu_info['efficiency_cores'],
+            **gpu_info
+        }
+        
+        # Set optimal device settings
+        if capabilities['has_mps']:
+            capabilities['recommended_device'] = 'auto'
+            capabilities['recommended_compute_type'] = 'float32'
+        elif capabilities['has_cuda']:
+            capabilities['recommended_device'] = 'cuda'
+            capabilities['recommended_compute_type'] = 'float16'
+        else:
+            capabilities['recommended_device'] = 'cpu'
+            capabilities['recommended_compute_type'] = 'float32'
+        
+        return capabilities
+
+def load_user_config():
+    """Load user configuration from config file"""
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to load config file: {e}")
+    return {}
+
+def save_user_config(config):
+    """Save user configuration to config file"""
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True)
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"✓ Configuration saved to {CONFIG_FILE}")
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to save config file: {e}")
+
+def prompt_user_for_system_config():
+    """Prompt user for system configuration when detection fails"""
+    print("\n🔧 System detection failed. Please provide system information:")
+    print("This will be saved for future use to avoid detection timeouts.\n")
+    
+    config = {}
+    
+    # Ask for system type
+    while True:
+        system = input("System type (1=Apple Silicon Mac, 2=Intel Mac, 3=Linux, 4=Windows): ").strip()
+        if system == '1':
+            config['platform'] = 'Darwin'
+            config['machine'] = 'arm64'
+            break
+        elif system == '2':
+            config['platform'] = 'Darwin'
+            config['machine'] = 'x86_64'
+            break
+        elif system == '3':
+            config['platform'] = 'Linux'
+            config['machine'] = 'x86_64'
+            break
+        elif system == '4':
+            config['platform'] = 'Windows'
+            config['machine'] = 'AMD64'
+            break
+        else:
+            print("Please enter 1, 2, 3, or 4")
+    
+    # Ask for memory
+    while True:
+        try:
+            memory = input("System memory in GB (e.g., 16): ").strip()
+            config['system_memory_gb'] = int(memory)
+            if config['system_memory_gb'] > 0:
+                break
+            else:
+                print("Please enter a positive number")
+        except ValueError:
+            print("Please enter a valid number")
+    
+    # Ask for CPU cores
+    while True:
+        try:
+            cores = input("Number of CPU cores (e.g., 8): ").strip()
+            config['cpu_count'] = int(cores)
+            if config['cpu_count'] > 0:
+                break
+            else:
+                print("Please enter a positive number")
+        except ValueError:
+            print("Please enter a valid number")
+    
+    # Ask for GPU
+    if config['platform'] == 'Darwin' and config['machine'] == 'arm64':
+        config['has_mps'] = True
+        config['gpu_name'] = 'Apple Silicon GPU'
+        while True:
+            try:
+                gpu_cores = input("GPU cores (if known, otherwise press Enter for default): ").strip()
+                if gpu_cores:
+                    config['gpu_cores'] = int(gpu_cores)
+                else:
+                    config['gpu_cores'] = max(8, config['cpu_count'])
+                break
+            except ValueError:
+                print("Please enter a valid number or press Enter")
+    else:
+        gpu_choice = input("Do you have a NVIDIA GPU with CUDA? (y/n): ").strip().lower()
+        config['has_cuda'] = gpu_choice in ['y', 'yes']
+        config['has_mps'] = False
+        config['gpu_cores'] = 0
+    
+    # Set optimal defaults based on configuration
+    if config.get('has_mps'):
+        config['recommended_device'] = 'auto'
+        config['recommended_compute_type'] = 'float32'
+    elif config.get('has_cuda'):
+        config['recommended_device'] = 'cuda'
+        config['recommended_compute_type'] = 'float16'
+    else:
+        config['recommended_device'] = 'cpu'
+        config['recommended_compute_type'] = 'float32'
+    
+    print(f"\n✓ Configuration complete:")
+    print(f"  Platform: {config['platform']} ({config['machine']})")
+    print(f"  Memory: {config['system_memory_gb']}GB")
+    print(f"  CPU Cores: {config['cpu_count']}")
+    print(f"  GPU: {'Yes' if config.get('has_mps') or config.get('has_cuda') else 'No'}")
+    print(f"  Recommended Device: {config['recommended_device']}")
+    
+    return config
 
 
 def parse_arguments():
@@ -66,6 +387,12 @@ def parse_arguments():
     )
     
     parser.add_argument(
+        "--force-parallel",
+        action="store_true",
+        help="Force parallel processing even for short files (experimental)"
+    )
+    
+    parser.add_argument(
         "--preload",
         action="store_true",
         help="Pre-load model for faster subsequent usage"
@@ -75,6 +402,18 @@ def parse_arguments():
         "--cache-stats",
         action="store_true",
         help="Show model cache statistics and exit"
+    )
+    
+    parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help="Show saved system configuration and exit"
+    )
+    
+    parser.add_argument(
+        "--reset-config",
+        action="store_true",
+        help="Reset saved system configuration and exit"
     )
     
     parser.add_argument(
@@ -101,6 +440,12 @@ def parse_arguments():
         "--benchmark",
         action="store_true",
         help="Enable performance benchmarking and show detailed metrics"
+    )
+    
+    parser.add_argument(
+        "-tm", "--time-minutes",
+        type=float,
+        help="Only transcribe the first N minutes of audio (e.g., -tm 5.5 for 5.5 minutes)"
     )
     
     return parser.parse_args()
@@ -149,15 +494,17 @@ def get_audio_duration(file_path):
             'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', str(file_path)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
         duration = float(result.stdout.strip())
         return duration
     except (subprocess.CalledProcessError, ValueError) as e:
         raise RuntimeError(f"Failed to get audio duration: {e}")
 
 
-def should_use_parallel_processing(duration_seconds, min_duration_minutes=30):
+def should_use_parallel_processing(duration_seconds, min_duration_minutes=120):
     """Determine if file should be processed with parallel chunking"""
+    # Default to 2 hours minimum to essentially disable parallel processing
+    # Use --force-parallel flag to enable for shorter files
     min_duration_seconds = min_duration_minutes * 60
     return duration_seconds > min_duration_seconds
 
@@ -251,23 +598,24 @@ def detect_device_capabilities():
         # Fallback memory detection
         try:
             if platform.system() == 'Darwin':
-                result = subprocess.run(['sysctl', 'hw.memsize'], capture_output=True, text=True)
+                result = subprocess.run(['sysctl', 'hw.memsize'], capture_output=True, text=True, timeout=2)
                 if result.returncode == 0:
                     mem_bytes = int(result.stdout.split(':')[1].strip())
                     capabilities['system_memory_gb'] = mem_bytes // (1024**3)
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to detect system memory (sysctl timeout/error), using conservative estimate")
+            capabilities['system_memory_gb'] = 16  # Conservative default
     
     # Detect CPU features
     if platform.system() == 'Darwin' and platform.machine() == 'arm64':
         # Apple Silicon detection
         try:
             result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'], 
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, timeout=2)
             if result.returncode == 0:
                 capabilities['cpu_brand'] = result.stdout.strip()
-        except:
-            pass
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to detect CPU brand (sysctl timeout/error), proceeding without brand info")
         
         # Get actual GPU capabilities at runtime
         gpu_info = get_apple_silicon_gpu_info()
@@ -465,52 +813,32 @@ def get_apple_silicon_gpu_info():
         'memory_bandwidth_gbps': 0
     }
     
+    # Skip system_profiler and ioreg to avoid hangs
+    # Use conservative defaults for Apple Silicon
     try:
-        # Get GPU core count using system_profiler (plain text is more reliable)
-        result = subprocess.run(['system_profiler', 'SPDisplaysDataType'], 
-                              capture_output=True, text=True)
-        if result.returncode == 0:
-            import re
-            # Look for "Total Number of Cores: X" pattern
-            cores_match = re.search(r'Total Number of Cores:\s*(\d+)', result.stdout)
-            if cores_match:
-                gpu_info['gpu_cores'] = int(cores_match.group(1))
-            else:
-                # Alternative pattern for older macOS versions
-                cores_match = re.search(r'(\d+)[-\s]core', result.stdout.lower())
-                if cores_match:
-                    gpu_info['gpu_cores'] = int(cores_match.group(1))
-    except:
-        pass
-    
-    # Try alternative method using ioreg
-    if gpu_info['gpu_cores'] == 0:
-        try:
-            result = subprocess.run(['ioreg', '-l', '-w0'], capture_output=True, text=True)
-            if result.returncode == 0:
-                # Look for GPU core information in ioreg output
-                import re
-                # This is a simplified search - actual parsing would be more complex
-                gpu_matches = re.findall(r'gpu-core-count["\s]=\s*(\d+)', result.stdout)
-                if gpu_matches:
-                    gpu_info['gpu_cores'] = int(gpu_matches[0])
-        except:
-            pass
-    
-    # Get performance metrics using sysctl
-    try:
-        # Get performance and efficiency core counts
+        # Get CPU core counts using sysctl with timeout
         perf_result = subprocess.run(['sysctl', '-n', 'hw.perflevel0.physicalcpu'], 
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, timeout=2)
         if perf_result.returncode == 0:
             gpu_info['performance_cores'] = int(perf_result.stdout.strip())
         
         eff_result = subprocess.run(['sysctl', '-n', 'hw.perflevel1.physicalcpu'], 
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, timeout=2)
         if eff_result.returncode == 0:
             gpu_info['efficiency_cores'] = int(eff_result.stdout.strip())
-    except:
-        pass
+    except Exception as e:
+        # Use conservative defaults if sysctl fails
+        print(f"⚠️  Warning: Failed to detect CPU cores (sysctl timeout/error), using conservative defaults")
+        gpu_info['performance_cores'] = 4
+        gpu_info['efficiency_cores'] = 4
+    
+    # Use conservative GPU core estimate based on CPU cores
+    total_cpu_cores = gpu_info['performance_cores'] + gpu_info['efficiency_cores']
+    if total_cpu_cores > 0:
+        # Rough estimate: GPU cores are usually similar to or less than total CPU cores
+        gpu_info['gpu_cores'] = max(8, total_cpu_cores)
+    else:
+        gpu_info['gpu_cores'] = 8  # Conservative default for Apple Silicon
     
     return gpu_info
 
@@ -612,7 +940,7 @@ class ModelPool:
         self._use_cache = True  # Enable cache integration
         
     def initialize(self):
-        """Initialize the model pool using cached models"""
+        """Initialize the model pool using a single shared model reference"""
         if self._initialized:
             return
             
@@ -620,27 +948,26 @@ class ModelPool:
             if self._initialized:
                 return
                 
-            print(f"📦 Initializing model pool with {self.pool_size} instances...")
+            print(f"📦 Initializing simplified model pool...")
             start_time = time.time()
             
-            # Check if we can reuse cached model
-            cache_stats = _global_model_cache.get_cache_stats()
-            cache_key = f"{self.model_size}_{self.device}_{self.compute_type}"
-            
-            if cache_stats['cached_models'] > 0:
-                print(f"🔄 Leveraging cached model for pool initialization...")
-            
-            for i in range(self.pool_size):
-                try:
-                    # Use cached model for faster pool initialization
-                    model = initialize_whisper_model(
-                        self.model_size, self.device, self.compute_type, use_cache=self._use_cache
-                    )
-                    self.models.put(model)
-                    print(f"✓ Model {i+1}/{self.pool_size} ready")
-                except Exception as e:
-                    print(f"⚠️  Failed to load model {i+1}: {e}")
-                    # Put None as placeholder to maintain pool size
+            # Create a single shared model instance instead of multiple
+            # This avoids GPU context conflicts and memory issues
+            try:
+                shared_model = initialize_whisper_model(
+                    self.model_size, self.device, self.compute_type, use_cache=True
+                )
+                
+                # Put the same model reference in the pool multiple times
+                # This is safe because faster-whisper models are stateless for transcription
+                for i in range(self.pool_size):
+                    self.models.put(shared_model)
+                    print(f"✓ Model reference {i+1}/{self.pool_size} ready")
+                    
+            except Exception as e:
+                print(f"⚠️  Failed to initialize model pool: {e}")
+                # Create fallback models if shared approach fails
+                for i in range(self.pool_size):
                     self.models.put(None)
             
             load_time = time.time() - start_time
@@ -923,11 +1250,11 @@ class GlobalModelCache:
             raise ImportError("faster-whisper is not installed. Run: pip install faster-whisper")
         
         try:
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            model = WhisperModel(model_size, device=device, compute_type=compute_type, num_workers=1)
             return model
         except Exception as e:
             print(f"⚠️  Falling back to CPU due to: {e}")
-            return WhisperModel(model_size, device="cpu", compute_type="float32")
+            return WhisperModel(model_size, device="cpu", compute_type="float32", num_workers=1)
     
     def preload_model(self, model_size, device="auto", compute_type="auto"):
         """Preload a model for faster access later"""
@@ -1057,6 +1384,42 @@ def report_device_capabilities(capabilities=None, verbose=False):
     print()
 
 
+def create_time_limited_audio(input_file, time_minutes, temp_dir):
+    """Create a temporary audio file limited to the first N minutes using ffmpeg"""
+    time_seconds = time_minutes * 60
+    limited_file = Path(temp_dir) / f"limited_{time_minutes}min.wav"
+    
+    try:
+        print(f"⏱️  Creating time-limited audio: first {time_minutes} minutes")
+        
+        # Use ffmpeg to extract first N minutes
+        cmd = [
+            'ffmpeg', '-y', '-i', str(input_file),
+            '-t', str(time_seconds),  # Duration limit
+            '-c', 'copy',  # Copy streams without re-encoding when possible
+            str(limited_file)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr}")
+        
+        # Verify the created file exists and has content
+        if not limited_file.exists() or limited_file.stat().st_size == 0:
+            raise RuntimeError("Time-limited audio file was not created properly")
+        
+        actual_duration = get_audio_duration(limited_file)
+        print(f"✓ Time-limited audio created: {format_time(actual_duration)}")
+        
+        return limited_file
+        
+    except Exception as e:
+        if limited_file.exists():
+            limited_file.unlink()  # Clean up failed file
+        raise RuntimeError(f"Failed to create time-limited audio: {e}")
+
+
 def create_audio_chunks(input_file, chunk_duration_minutes, temp_dir):
     """Split audio file into chunks using ffmpeg"""
     chunk_duration_seconds = chunk_duration_minutes * 60
@@ -1163,44 +1526,106 @@ def transcribe_chunk_with_pool(chunk_info, model_pool, transcription_params=None
             model_pool.return_model(model)
 
 
-def transcribe_chunk(chunk_info, model_size, device=None, compute_type=None):
-    """Transcribe a single audio chunk (legacy function for backward compatibility)"""
+def simple_transcribe_file(audio_file_path, model_size, device='cpu', compute_type='float32'):
+    """Simple transcription of a single audio file without any complexity"""
     try:
-        # Initialize model for this worker thread with optimal settings
-        model = initialize_whisper_model(model_size, device, compute_type)
+        from faster_whisper import WhisperModel
         
-        # Transcribe the chunk
+        print(f"Loading model '{model_size}' for transcription...")
+        model = WhisperModel(model_size, device=device, compute_type=compute_type, num_workers=1)
+        
+        print(f"Transcribing {Path(audio_file_path).name}...")
+        segments, info = model.transcribe(
+            str(audio_file_path),
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=1000),
+            temperature=0.0
+        )
+        
+        # Collect all segments
+        all_segments = []
+        for segment in segments:
+            all_segments.append({
+                'start': segment.start,
+                'end': segment.end,
+                'text': segment.text.strip()
+            })
+        
+        return {
+            'segments': all_segments,
+            'language': info.language,
+            'language_probability': info.language_probability,
+            'duration': info.duration
+        }
+        
+    except Exception as e:
+        print(f"Transcription failed: {e}")
+        return {
+            'segments': [],
+            'language': 'unknown',
+            'language_probability': 0.0,
+            'duration': 0.0,
+            'error': str(e)
+        }
+
+
+def transcribe_chunk_process(chunk_info_tuple):
+    """Standalone function for multiprocessing - transcribe a single chunk"""
+    chunk_info, model_size, device, compute_type = chunk_info_tuple
+    
+    try:
+        # Import inside function for multiprocessing compatibility
+        from faster_whisper import WhisperModel
+        from pathlib import Path
+        
+        # Use simple, safe settings
+        safe_device = device if device in ['cpu', 'cuda'] else 'cpu'
+        safe_compute_type = compute_type if compute_type in ['float32', 'float16'] else 'float32'
+        
+        print(f"Process loading model for chunk {chunk_info['index']}...")
+        model = WhisperModel(model_size, device=safe_device, compute_type=safe_compute_type, num_workers=1)
+        
+        print(f"Process transcribing chunk {chunk_info['index']}...")
         segments, info = model.transcribe(
             str(chunk_info['file']),
             beam_size=5,
             vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=1000)
+            vad_parameters=dict(min_silence_duration_ms=1000),
+            temperature=0.0
         )
         
         # Collect all segments with adjusted timestamps
-        chunk_segments = []
+        adjusted_segments = []
         for segment in segments:
-            # Adjust timestamps to reflect position in original file
             adjusted_segment = {
                 'start': segment.start + chunk_info['start_time'],
                 'end': segment.end + chunk_info['start_time'],
                 'text': segment.text.strip()
             }
-            chunk_segments.append(adjusted_segment)
+            adjusted_segments.append(adjusted_segment)
+        
+        print(f"✓ Chunk {chunk_info['index']} completed ({len(adjusted_segments)} segments)")
         
         return {
             'chunk_index': chunk_info['index'],
-            'segments': chunk_segments,
+            'segments': adjusted_segments,
             'language': info.language,
             'language_probability': info.language_probability
         }
         
     except Exception as e:
+        print(f"✗ Chunk {chunk_info['index']} failed: {e}")
         return {
             'chunk_index': chunk_info['index'],
             'error': str(e),
             'segments': []
         }
+
+
+def transcribe_chunk(chunk_info, model_size, device=None, compute_type=None):
+    """Transcribe a single audio chunk - wrapper for backward compatibility"""
+    return transcribe_chunk_process((chunk_info, model_size, device, compute_type))
 
 
 def assemble_transcripts(chunk_results):
@@ -1236,27 +1661,40 @@ def assemble_transcripts(chunk_results):
 
 
 def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duration_minutes, num_threads, device=None, compute_type=None):
-    """Transcribe audio file using parallel chunk processing with model pooling"""
+    """Transcribe audio file using parallel chunk processing with direct model creation"""
     temp_dir = None
-    model_pool = None
     
     try:
         # Create temporary directory for chunks
         temp_dir = tempfile.mkdtemp(prefix="whisper_chunks_")
         
-        # Get GPU memory info for optimization
-        memory_info = get_gpu_memory_info()
+        # Get capabilities from saved config or detection
+        capabilities = load_user_config()
+        if not capabilities:
+            # Use adapter pattern for cross-platform detection
+            system_adapter = SystemInfoAdapter()
+            capabilities = system_adapter.get_system_capabilities()
+        
+        # Calculate memory info from capabilities
+        system_memory_gb = capabilities.get('system_memory_gb', 16)
+        has_unified_memory = capabilities.get('has_mps', False)
+        
+        if has_unified_memory:
+            # For Apple Silicon, estimate available memory for GPU tasks
+            available_mb = int(system_memory_gb * 1024 * 0.4)  # 40% of system RAM
+        else:
+            available_mb = 8192  # Conservative default for other systems
         
         # Calculate optimal chunk size based on system capabilities
         duration = get_audio_duration(input_path)
         optimal_chunk_size = calculate_optimal_chunk_size(
-            duration, num_threads, memory_info['available_mb'], chunk_duration_minutes
+            duration, num_threads, available_mb, chunk_duration_minutes
         )
         
         print(f"Using {num_threads} threads for parallel processing")
         print(f"Optimal chunk size: {optimal_chunk_size} minutes (requested: {chunk_duration_minutes})")
-        if memory_info['has_unified_memory']:
-            print(f"🧠 GPU Memory: ~{memory_info['available_mb']//1024}GB unified memory available")
+        if has_unified_memory:
+            print(f"🧠 Unified Memory: ~{available_mb//1024}GB available for GPU tasks (from {system_memory_gb}GB total)")
         
         # Use optimal chunk size
         final_chunk_size = optimal_chunk_size
@@ -1264,8 +1702,7 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
         # Create audio chunks
         chunks = create_audio_chunks(input_path, final_chunk_size, temp_dir)
         
-        # Get optimized transcription parameters for this hardware
-        capabilities = detect_device_capabilities()
+        # Get optimized transcription parameters using existing capabilities
         transcription_params = get_optimal_transcription_params(capabilities, model_size, duration)
         print(f"🎯 Optimized parameters: beam_size={transcription_params['beam_size']}, VAD threshold={transcription_params['vad_parameters']['min_silence_duration_ms']}ms")
         
@@ -1275,31 +1712,26 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
             print("🚀 Pre-warming model cache for parallel processing...")
             preload_model_for_config(model_size, device, compute_type)
         
-        # Initialize model pool for efficient GPU utilization
-        # Use smaller pool size to avoid memory exhaustion
-        pool_size = min(num_threads, 3)  # Limit to 3 models max for GPU efficiency
-        model_pool = ModelPool(model_size, device, compute_type, pool_size)
-        model_pool.initialize()
-        
+        # Process chunks in parallel using separate processes
         print(f"\nProcessing {len(chunks)} chunks in parallel...")
         start_time = time.time()
         
-        # Process chunks in parallel using model pool
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
-            # Submit all chunk transcription tasks
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_threads) as executor:
+            # Submit all chunk transcription tasks using process-safe function
             future_to_chunk = {
-                executor.submit(transcribe_chunk_with_pool, chunk, model_pool, transcription_params): chunk
+                executor.submit(transcribe_chunk_process, (chunk, model_size, device, compute_type)): chunk
                 for chunk in chunks
             }
             
-            # Collect results as they complete
+            # Collect results as they complete with timeout
             chunk_results = []
             completed = 0
+            timeout_per_chunk = max(300, duration * 2)  # At least 5 minutes or 2x audio duration
             
-            for future in concurrent.futures.as_completed(future_to_chunk):
+            for future in concurrent.futures.as_completed(future_to_chunk, timeout=timeout_per_chunk * len(chunks)):
                 chunk = future_to_chunk[future]
                 try:
-                    result = future.result()
+                    result = future.result(timeout=timeout_per_chunk)
                     chunk_results.append(result)
                     completed += 1
                     
@@ -1307,6 +1739,13 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
                     elapsed = time.time() - start_time
                     print(f"✓ Chunk {chunk['index'] + 1}/{len(chunks)} completed ({progress:.1f}%) - Elapsed: {format_time(elapsed)}")
                     
+                except concurrent.futures.TimeoutError:
+                    print(f"✗ Chunk {chunk['index'] + 1} timed out after {timeout_per_chunk}s")
+                    chunk_results.append({
+                        'chunk_index': chunk['index'],
+                        'error': f'Timeout after {timeout_per_chunk}s',
+                        'segments': []
+                    })
                 except Exception as e:
                     print(f"✗ Chunk {chunk['index'] + 1} failed: {e}")
                     chunk_results.append({
@@ -1339,10 +1778,6 @@ def transcribe_audio_parallel(model_size, input_path, output_path, chunk_duratio
         print(f"  Output saved to: {output_path}")
         
     finally:
-        # Clean up model pool
-        if model_pool:
-            model_pool.cleanup()
-        
         # Clean up temporary directory
         if temp_dir and Path(temp_dir).exists():
             shutil.rmtree(temp_dir)
@@ -1371,7 +1806,7 @@ def initialize_whisper_model(model_size, device=None, compute_type=None, use_cac
         
         try:
             # Try optimal configuration first
-            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            model = WhisperModel(model_size, device=device, compute_type=compute_type, num_workers=1)
         except Exception as e:
             print(f"⚠️  Falling back to CPU due to: {e}")
             # Fallback to CPU with safe compute type
@@ -1466,9 +1901,7 @@ def transcribe_audio(model, input_path, output_path, transcription_params=None):
 def main():
     """Main entry point"""
     try:
-        print("DEBUG: Starting main function")
         args = parse_arguments()
-        print("DEBUG: Arguments parsed")
         
         # Handle cache stats option
         if args.cache_stats:
@@ -1484,18 +1917,79 @@ def main():
                 print("   No models currently cached")
             return 0
         
-        print("DEBUG: Handling device detection")
-        # Use simplified device detection to avoid hangs
-        print("🖥️  System: macOS (Apple Silicon)")
-        print("💻 Using CPU processing for reliable operation")
-        capabilities = {
-            'platform': 'Darwin',
-            'recommended_device': 'cpu',
-            'recommended_compute_type': 'float32',
-            'has_mps': False,
-            'has_cuda': False
-        }
-        print("DEBUG: Device detection completed")
+        # Handle show config option
+        if args.show_config:
+            config = load_user_config()
+            if config:
+                print("🔧 Saved System Configuration:")
+                print(f"   Platform: {config.get('platform', 'unknown')} ({config.get('machine', 'unknown')})")
+                print(f"   Memory: {config.get('system_memory_gb', 'unknown')}GB")
+                print(f"   CPU Cores: {config.get('cpu_count', 'unknown')}")
+                print(f"   GPU: {'Yes' if config.get('has_mps') or config.get('has_cuda') else 'No'}")
+                print(f"   Recommended Device: {config.get('recommended_device', 'unknown')}")
+                print(f"   Config file: {CONFIG_FILE}")
+            else:
+                print("📝 No saved configuration found.")
+                print(f"   Config would be saved to: {CONFIG_FILE}")
+            return 0
+        
+        # Handle reset config option
+        if args.reset_config:
+            if CONFIG_FILE.exists():
+                CONFIG_FILE.unlink()
+                print("✓ Configuration reset. Deleted saved configuration file.")
+            else:
+                print("📝 No configuration file found to reset.")
+            return 0
+        
+        # Try to load user configuration first
+        user_config = load_user_config()
+        
+        if user_config:
+            print("✓ Using saved system configuration")
+            capabilities = user_config.copy()
+            print(f"🖥️  System: {capabilities['platform']} ({capabilities.get('machine', 'unknown')})")
+            if capabilities.get('has_mps'):
+                print("⚡ GPU: Apple Silicon GPU acceleration available")
+            elif capabilities.get('has_cuda'):
+                print("⚡ GPU: NVIDIA CUDA acceleration available")
+            else:
+                print("💻 Using CPU processing")
+        else:
+            # Try simple detection first, if it fails prompt user
+            try:
+                # Use adapter pattern for cross-platform system detection
+                print("🖥️  Attempting automatic system detection...")
+                system_adapter = SystemInfoAdapter()
+                capabilities = system_adapter.get_system_capabilities()
+                
+                if capabilities.get('has_mps'):
+                    print("⚡ GPU: Apple Silicon detected")
+                elif capabilities.get('has_cuda'):
+                    print(f"⚡ GPU: {capabilities.get('gpu_name')} detected")
+                else:
+                    print("💻 Using CPU processing")
+                    
+            except Exception as e:
+                print(f"⚠️  Automatic system detection failed: {e}")
+                print("⚠️  Using conservative defaults to avoid system detection hangs")
+                
+                # Prompt user for configuration
+                try:
+                    capabilities = prompt_user_for_system_config()
+                    save_user_config(capabilities)
+                except (KeyboardInterrupt, EOFError):
+                    print("\n⚠️  User cancelled configuration. Using safe defaults.")
+                    capabilities = {
+                        'platform': 'Darwin',
+                        'recommended_device': 'cpu',
+                        'recommended_compute_type': 'float32',
+                        'has_mps': False,
+                        'has_cuda': False,
+                        'system_memory_gb': 16,
+                        'cpu_count': 8,
+                        'gpu_cores': 8
+                    }
         
         # Handle preload option
         if args.preload:
@@ -1513,55 +2007,87 @@ def main():
             print("Error: -o/--output is required for transcription", file=sys.stderr)
             return 1
         
-        print("DEBUG: Validating input file")
         # Validate input file
         input_path = validate_input_file(args.input_file)
         print(f"✓ Input file validated: {input_path}")
         
-        print("DEBUG: Validating output path")
         # Validate output path
         output_path = validate_output_path(args.output)
         print(f"✓ Output path validated: {output_path}")
         
-        print("DEBUG: Getting audio duration")
-        # Check audio duration to decide on processing method
-        duration = get_audio_duration(input_path)
-        print(f"✓ Audio duration: {format_time(duration)}")
-        print("DEBUG: Duration calculated successfully")
+        # Handle time limiting if requested
+        actual_input_path = input_path
+        temp_dir = None
+        time_limited_file = None
         
-        # Use simple, reliable device settings
-        device = args.device if args.device != 'auto' else 'cpu'
-        compute_type = args.compute_type if args.compute_type != 'auto' else 'float32'
+        if args.time_minutes:
+            if args.time_minutes <= 0:
+                print("Error: --time-minutes must be greater than 0", file=sys.stderr)
+                return 1
+            
+            # Create temporary directory for the time-limited file
+            temp_dir = tempfile.mkdtemp(prefix='transcribe_time_limit_')
+            try:
+                time_limited_file = create_time_limited_audio(input_path, args.time_minutes, temp_dir)
+                actual_input_path = time_limited_file
+                print(f"✓ Time-limited processing: using first {args.time_minutes} minutes")
+            except Exception as e:
+                print(f"Error creating time-limited audio: {e}", file=sys.stderr)
+                if temp_dir and Path(temp_dir).exists():
+                    shutil.rmtree(temp_dir)
+                return 1
+        
+        # Check audio duration to decide on processing method
+        duration = get_audio_duration(actual_input_path)
+        print(f"✓ Audio duration: {format_time(duration)}")
+        
+        # Use conservative device settings to avoid GPU context conflicts in parallel processing
+        if args.device != 'auto':
+            device = args.device
+        else:
+            # For parallel processing, use CPU to avoid GPU context conflicts
+            device = 'cpu'
+        
+        if args.compute_type != 'auto':
+            compute_type = args.compute_type
+        else:
+            compute_type = 'float32'
         
         # Determine processing method
         use_parallel = (
             not args.no_parallel and 
-            should_use_parallel_processing(duration)
+            (args.force_parallel or should_use_parallel_processing(duration))
         )
         
         if use_parallel:
-            # Get thread count and optimize for GPU memory
+            # Get thread count and use simple optimization
             initial_threads = get_optimal_thread_count(args.threads)
-            memory_info = get_gpu_memory_info()
+            memory_info = {'available_mb': 8192}  # Conservative estimate
             
-            # Optimize thread count based on GPU memory constraints
+            # Optimize thread count based on conservative memory constraints
             num_threads = optimize_thread_count_for_gpu(
                 initial_threads, memory_info['available_mb'], args.model
             )
             
-            print(f"✓ Using parallel processing ({num_threads} threads)")
+            if args.force_parallel:
+                print(f"⚠️  Forcing parallel processing ({num_threads} threads) - experimental")
+            else:
+                print(f"✓ Using parallel processing ({num_threads} threads)")
             
             # Process with parallel chunking
             transcribe_audio_parallel(
-                args.model, input_path, output_path, 
+                args.model, actual_input_path, output_path, 
                 args.chunk_size, num_threads, device, compute_type
             )
         else:
-            # Use traditional single-threaded processing
+            # Use reliable single-threaded processing
             if args.no_parallel:
                 print("✓ Parallel processing disabled by user")
+            elif args.force_parallel:
+                print("⚠️  Force parallel ignored - file too short for effective parallelization")
+                print("✓ Using sequential processing (most efficient for short files)")
             else:
-                print("✓ Using sequential processing (file under 30 minutes)")
+                print("✓ Using sequential processing (file under 2 hours)")
             
             # Use simple, reliable transcription parameters
             transcription_params = {
@@ -1576,15 +2102,26 @@ def main():
             model = initialize_whisper_model(args.model, device, compute_type, use_cache=False)
             
             # Transcribe audio file
-            transcribe_audio(model, input_path, output_path, transcription_params)
+            transcribe_audio(model, actual_input_path, output_path, transcription_params)
+        
+        # Clean up temporary files if time limiting was used
+        if temp_dir and Path(temp_dir).exists():
+            shutil.rmtree(temp_dir)
+            print(f"✓ Cleaned up temporary files")
         
         return 0
         
     except (FileNotFoundError, ValueError, PermissionError, ImportError, RuntimeError) as e:
         print(f"Error: {e}", file=sys.stderr)
+        # Clean up temporary files on error
+        if 'temp_dir' in locals() and temp_dir and Path(temp_dir).exists():
+            shutil.rmtree(temp_dir)
         return 1
     except KeyboardInterrupt:
         print("\nTranscription interrupted by user", file=sys.stderr)
+        # Clean up temporary files on interruption
+        if 'temp_dir' in locals() and temp_dir and Path(temp_dir).exists():
+            shutil.rmtree(temp_dir)
         return 1
 
 

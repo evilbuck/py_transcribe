@@ -14,7 +14,7 @@ from .utils import get_audio_duration, format_time
 from .logger import get_logger
 
 
-def should_use_parallel_processing(duration_seconds: float, min_duration_minutes: int = 30) -> bool:
+def should_use_parallel_processing(duration_seconds: float, min_duration_minutes: int = 7) -> bool:
     """Determine if file should be processed with parallel chunking"""
     min_duration_seconds = min_duration_minutes * 60
     return duration_seconds > min_duration_seconds
