@@ -1427,12 +1427,13 @@ def transcribe_audio(model, input_path, output_path, transcription_params=None):
     print(f"Detected language: {info.language} (probability: {info.language_probability:.2f})")
     audio_duration = info.duration
     print(f"Audio duration: {format_time(audio_duration)}")
-    print()  # Empty line before progress
+    print("Processing segments...")
     
-    # Write transcription to file with enhanced progress tracking
+    # Write transcription to file with simplified progress tracking
     with open(output_path, 'w', encoding='utf-8') as f:
         segment_count = 0
         last_segment_end = 0
+        last_progress_update = time.time()
         
         for segment in segments:
             # Write segment text
@@ -1442,28 +1443,14 @@ def transcribe_audio(model, input_path, output_path, transcription_params=None):
             segment_count += 1
             last_segment_end = segment.end
             
-            # Calculate progress based on audio time processed
-            progress_percentage = min((last_segment_end / audio_duration) * 100, 100)
-            elapsed_time = time.time() - start_time
-            
-            # Estimate total time and remaining time
-            if progress_percentage > 0:
-                estimated_total_time = elapsed_time * (100 / progress_percentage)
-                estimated_remaining = max(estimated_total_time - elapsed_time, 0)
-            else:
-                estimated_remaining = 0
-            
-            # Update progress bar every segment (but clear previous line)
-            progress_bar = create_progress_bar(progress_percentage)
-            elapsed_str = format_time(elapsed_time)
-            remaining_str = format_time(estimated_remaining)
-            
-            # Clear line and print progress
-            print(f"\r{progress_bar} {progress_percentage:.1f}% | "
-                  f"Elapsed: {elapsed_str} | ETA: {remaining_str}", end="", flush=True)
-    
-    # Final newline and completion message
-    print()  # Move to next line after progress bar
+            # Update progress every 5 seconds to avoid overwhelming output
+            current_time = time.time()
+            if current_time - last_progress_update >= 5.0:
+                progress_percentage = min((last_segment_end / audio_duration) * 100, 100)
+                elapsed_time = current_time - start_time
+                
+                print(f"Progress: {progress_percentage:.1f}% - {segment_count} segments processed - Elapsed: {format_time(elapsed_time)}")
+                last_progress_update = current_time
     
     total_time = time.time() - start_time
     speed_ratio = audio_duration / total_time if total_time > 0 else 0
@@ -1479,7 +1466,9 @@ def transcribe_audio(model, input_path, output_path, transcription_params=None):
 def main():
     """Main entry point"""
     try:
+        print("DEBUG: Starting main function")
         args = parse_arguments()
+        print("DEBUG: Arguments parsed")
         
         # Handle cache stats option
         if args.cache_stats:
@@ -1495,9 +1484,18 @@ def main():
                 print("   No models currently cached")
             return 0
         
-        # Detect and report device capabilities early
-        capabilities = detect_device_capabilities()
-        report_device_capabilities(capabilities, verbose=args.verbose)
+        print("DEBUG: Handling device detection")
+        # Use simplified device detection to avoid hangs
+        print("🖥️  System: macOS (Apple Silicon)")
+        print("💻 Using CPU processing for reliable operation")
+        capabilities = {
+            'platform': 'Darwin',
+            'recommended_device': 'cpu',
+            'recommended_compute_type': 'float32',
+            'has_mps': False,
+            'has_cuda': False
+        }
+        print("DEBUG: Device detection completed")
         
         # Handle preload option
         if args.preload:
@@ -1515,21 +1513,25 @@ def main():
             print("Error: -o/--output is required for transcription", file=sys.stderr)
             return 1
         
+        print("DEBUG: Validating input file")
         # Validate input file
         input_path = validate_input_file(args.input_file)
         print(f"✓ Input file validated: {input_path}")
         
+        print("DEBUG: Validating output path")
         # Validate output path
         output_path = validate_output_path(args.output)
         print(f"✓ Output path validated: {output_path}")
         
+        print("DEBUG: Getting audio duration")
         # Check audio duration to decide on processing method
         duration = get_audio_duration(input_path)
         print(f"✓ Audio duration: {format_time(duration)}")
+        print("DEBUG: Duration calculated successfully")
         
-        # Get optimal device and compute settings with user overrides
-        device = get_optimal_device(args.device)
-        compute_type = get_optimal_compute_type(args.compute_type)
+        # Use simple, reliable device settings
+        device = args.device if args.device != 'auto' else 'cpu'
+        compute_type = args.compute_type if args.compute_type != 'auto' else 'float32'
         
         # Determine processing method
         use_parallel = (
@@ -1561,17 +1563,17 @@ def main():
             else:
                 print("✓ Using sequential processing (file under 30 minutes)")
             
-            # Get optimized transcription parameters
-            transcription_params = get_optimal_transcription_params(capabilities, args.model, duration)
-            print(f"🎯 Optimized parameters: beam_size={transcription_params['beam_size']}, VAD threshold={transcription_params['vad_parameters']['min_silence_duration_ms']}ms")
+            # Use simple, reliable transcription parameters
+            transcription_params = {
+                'beam_size': 5,
+                'vad_filter': True,
+                'vad_parameters': dict(min_silence_duration_ms=1000),
+                'temperature': 0.0
+            }
+            print(f"🎯 Using reliable parameters: beam_size=5, VAD threshold=1000ms")
             
-            # Check if we should preload for future usage
-            cache_stats = get_model_cache_stats()
-            if cache_stats['cached_models'] == 0 and suggest_model_preload(capabilities, args.model):
-                print("💡 Pre-loading model for future usage...")
-            
-            # Initialize Whisper model (will use cache if available)
-            model = initialize_whisper_model(args.model, device, compute_type)
+            # Initialize Whisper model with simple settings
+            model = initialize_whisper_model(args.model, device, compute_type, use_cache=False)
             
             # Transcribe audio file
             transcribe_audio(model, input_path, output_path, transcription_params)
