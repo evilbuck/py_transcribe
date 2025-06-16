@@ -7,13 +7,16 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
+from device_detection import OptimalConfiguration, setup_environment
+
 
 class AudioTranscriber:
     """Core audio transcription class using faster-whisper"""
     
     SUPPORTED_FORMATS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac', '.wma'}
     
-    def __init__(self, model_size: str = "base", device: Optional[str] = None, compute_type: Optional[str] = None):
+    def __init__(self, model_size: str = "base", device: Optional[str] = None, compute_type: Optional[str] = None, 
+                 batch_size: Optional[int] = None, num_workers: Optional[int] = None):
         """
         Initialize the audio transcriber
         
@@ -21,25 +24,23 @@ class AudioTranscriber:
             model_size: Whisper model size ('tiny', 'base', 'small', 'medium', 'large')
             device: Device to use ('auto', 'cpu', 'cuda', 'mps')
             compute_type: Compute type ('auto', 'float32', 'float16', 'int8', 'int8_float16')
+            batch_size: Batch size for processing (auto-detected if None)
+            num_workers: Number of worker threads (auto-detected if None)
         """
         self.model_size = model_size
-        self.device = self._get_optimal_device(device)
-        self.compute_type = self._get_optimal_compute_type(compute_type)
+        self.config = OptimalConfiguration()
+        
+        # Determine optimal configuration
+        self.device = self.config.get_optimal_device(device)
+        self.compute_type = self.config.get_optimal_compute_type(self.device, compute_type)
+        self.batch_size = batch_size or self.config.get_optimal_batch_size(self.device, model_size)
+        self.num_workers = num_workers or self.config.get_optimal_threads()
+        
+        # Set up environment for optimal performance
+        setup_environment(self.num_workers)
+        
         self.model = None
         
-    def _get_optimal_device(self, override: Optional[str] = None) -> str:
-        """Determine optimal device for faster-whisper"""
-        if override and override != "auto":
-            return override
-        # Simple device detection - prefer CPU for reliability
-        return "cpu"
-    
-    def _get_optimal_compute_type(self, override: Optional[str] = None) -> str:
-        """Determine optimal compute type to avoid warnings"""
-        if override and override != "auto":
-            return override
-        # Use float32 for CPU reliability
-        return "float32"
     
     def _load_model(self) -> None:
         """Load the Whisper model if not already loaded"""
@@ -55,16 +56,19 @@ class AudioTranscriber:
             self.model = WhisperModel(
                 self.model_size, 
                 device=self.device, 
-                compute_type=self.compute_type
+                compute_type=self.compute_type,
+                num_workers=self.num_workers if self.device == "cpu" else 1
             )
         except Exception as e:
             # Fallback to CPU with safe compute type
             self.device = "cpu"
             self.compute_type = "float32"
+            self.batch_size = 1
             self.model = WhisperModel(
                 self.model_size, 
                 device=self.device, 
-                compute_type=self.compute_type
+                compute_type=self.compute_type,
+                num_workers=self.num_workers
             )
     
     def validate_input_file(self, file_path: str) -> Path:
@@ -253,11 +257,21 @@ class AudioTranscriber:
             'output_path': str(output_file)
         }
     
-    def get_model_info(self) -> Dict[str, str]:
+    def get_model_info(self) -> Dict[str, Any]:
         """Get information about the current model configuration"""
-        return {
+        info = {
             'model_size': self.model_size,
             'device': self.device,
             'compute_type': self.compute_type,
+            'batch_size': self.batch_size,
+            'num_workers': self.num_workers,
             'model_loaded': self.model is not None
         }
+        
+        # Add device capabilities summary
+        config_summary = self.config.get_configuration_summary(
+            self.device, self.compute_type, self.num_workers, self.batch_size
+        )
+        info['capabilities'] = config_summary['capabilities']
+        
+        return info

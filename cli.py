@@ -101,6 +101,16 @@ class ProgressTracker:
     help='Force specific compute type'
 )
 @click.option(
+    '--batch-size',
+    type=click.IntRange(min=1, max=64),
+    help='Batch size for processing (auto-detected if not specified)'
+)
+@click.option(
+    '--num-workers',
+    type=click.IntRange(min=1, max=32),
+    help='Number of worker threads (auto-detected if not specified)'
+)
+@click.option(
     '--verbose', '-v',
     is_flag=True,
     help='Show detailed system information and optimization hints'
@@ -126,7 +136,7 @@ class ProgressTracker:
     help='End transcription at N seconds'
 )
 @click.version_option(version="1.0.0", prog_name="transcribe")
-def main(input_file, output, model, device, compute_type, verbose, quiet, max_duration, start_time, end_time):
+def main(input_file, output, model, device, compute_type, batch_size, num_workers, verbose, quiet, max_duration, start_time, end_time):
     """
     Transcribe audio files to text using faster-whisper (offline)
     
@@ -161,7 +171,9 @@ def main(input_file, output, model, device, compute_type, verbose, quiet, max_du
         transcriber = AudioTranscriber(
             model_size=model.lower(),
             device=device.lower() if device != 'auto' else None,
-            compute_type=compute_type.lower() if compute_type != 'auto' else None
+            compute_type=compute_type.lower() if compute_type != 'auto' else None,
+            batch_size=batch_size,
+            num_workers=num_workers
         )
         
         # Validate inputs and get basic info
@@ -184,10 +196,23 @@ def main(input_file, output, model, device, compute_type, verbose, quiet, max_du
             console.print(f"  Model size: [cyan]{model_info['model_size']}[/cyan]")
             console.print(f"  Device: [cyan]{model_info['device']}[/cyan]")
             console.print(f"  Compute type: [cyan]{model_info['compute_type']}[/cyan]")
+            console.print(f"  Batch size: [cyan]{model_info['batch_size']}[/cyan]")
+            console.print(f"  Worker threads: [cyan]{model_info['num_workers']}[/cyan]")
+            
+            # Show device capabilities
+            caps = model_info['capabilities']
+            console.print("\n[bold]Device Capabilities:[/bold]")
+            console.print(f"  CUDA available: [cyan]{caps['has_cuda']}[/cyan]")
+            if caps['cuda_version']:
+                console.print(f"  CUDA version: [cyan]{caps['cuda_version']}[/cyan]")
+            if caps['gpu_memory_mb']:
+                console.print(f"  GPU memory: [cyan]{caps['gpu_memory_mb']} MB[/cyan]")
+            console.print(f"  Apple MPS available: [cyan]{caps['has_mps']}[/cyan]")
+            console.print(f"  CPU cores: [cyan]{caps['cpu_cores']}[/cyan]")
             
             if duration > 0:
                 estimated_time = estimate_processing_time(duration, model_info['model_size'])
-                console.print(f"  Estimated processing time: [yellow]{format_time(estimated_time)}[/yellow]")
+                console.print(f"\n  Estimated processing time: [yellow]{format_time(estimated_time)}[/yellow]")
             console.print()
         
         # Validate output path

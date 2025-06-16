@@ -33,8 +33,10 @@ class TestAudioTranscriber(unittest.TestCase):
         """Test transcriber initialization with default parameters"""
         transcriber = AudioTranscriber()
         self.assertEqual(transcriber.model_size, "base")
-        self.assertEqual(transcriber.device, "cpu")
-        self.assertEqual(transcriber.compute_type, "float32")
+        # Device auto-detection may choose mps on Mac, cuda on NVIDIA systems, or cpu
+        self.assertIn(transcriber.device, ["cpu", "mps", "cuda"])
+        # Compute type depends on device
+        self.assertIn(transcriber.compute_type, ["float32", "float16", "int8", "int8_float16"])
 
     def test_init_custom_params(self):
         """Test transcriber initialization with custom parameters"""
@@ -86,11 +88,13 @@ class TestAudioTranscriber(unittest.TestCase):
     def test_get_model_info(self):
         """Test getting model information"""
         info = self.transcriber.get_model_info()
-        expected_keys = {'model_size', 'device', 'compute_type', 'model_loaded'}
+        expected_keys = {'model_size', 'device', 'compute_type', 'batch_size', 'num_workers', 'model_loaded', 'capabilities'}
         self.assertEqual(set(info.keys()), expected_keys)
         self.assertEqual(info['model_size'], 'tiny')
-        self.assertEqual(info['device'], 'cpu')
-        self.assertEqual(info['compute_type'], 'float32')
+        # Device could be cpu, mps, or cuda depending on system capabilities
+        self.assertIn(info['device'], ['cpu', 'mps', 'cuda'])
+        # Compute type depends on device
+        self.assertIn(info['compute_type'], ['float32', 'float16', 'int8', 'int8_float16'])
         self.assertFalse(info['model_loaded'])
 
     def test_supported_formats(self):
