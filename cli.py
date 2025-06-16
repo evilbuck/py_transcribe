@@ -110,8 +110,23 @@ class ProgressTracker:
     is_flag=True,
     help='Suppress progress display and non-essential output'
 )
+@click.option(
+    '--max-duration',
+    type=click.IntRange(min=1),
+    help='Limit transcription to first N minutes of audio'
+)
+@click.option(
+    '--start-time',
+    type=click.FloatRange(min=0),
+    help='Start transcription at N seconds'
+)
+@click.option(
+    '--end-time',
+    type=click.FloatRange(min=0),
+    help='End transcription at N seconds'
+)
 @click.version_option(version="1.0.0", prog_name="transcribe")
-def main(input_file, output, model, device, compute_type, verbose, quiet):
+def main(input_file, output, model, device, compute_type, verbose, quiet, max_duration, start_time, end_time):
     """
     Transcribe audio files to text using faster-whisper (offline)
     
@@ -119,6 +134,19 @@ def main(input_file, output, model, device, compute_type, verbose, quiet):
     
     Supported audio formats: MP3, WAV, M4A, OGG, FLAC, AAC, WMA
     """
+    # Validate time parameter combinations first, before any operations
+    if max_duration and (start_time is not None or end_time is not None):
+        error_msg = "Error: --max-duration cannot be used with --start-time or --end-time"
+        console.print(f"[red]{error_msg}[/red]")
+        click.echo(error_msg, err=True)
+        sys.exit(1)
+    
+    if start_time is not None and end_time is not None and start_time >= end_time:
+        error_msg = "Error: --start-time must be less than --end-time"
+        console.print(f"[red]{error_msg}[/red]")
+        click.echo(error_msg, err=True)
+        sys.exit(1)
+    
     try:
         # Set console quiet mode
         if quiet:
@@ -169,14 +197,17 @@ def main(input_file, output, model, device, compute_type, verbose, quiet):
         if not quiet:
             console.print(f"\n[bold]Loading Whisper model '{model}'...[/bold]")
         
-        start_time = time.time()
+        transcription_start_time = time.time()
         
         with progress_tracker:
             # Transcribe the file
             result = transcriber.transcribe_file(
                 str(input_file),
                 str(output),
-                progress_callback=progress_tracker.update if not quiet else None
+                progress_callback=progress_tracker.update if not quiet else None,
+                max_duration_minutes=max_duration,
+                start_time_seconds=start_time,
+                end_time_seconds=end_time
             )
         
         # Show results
@@ -196,44 +227,44 @@ def main(input_file, output, model, device, compute_type, verbose, quiet):
         
     except FileNotFoundError as e:
         error_msg = f"Error: {e}"
-        console.print(f"[red]{error_msg}[/red]", err=True)
+        console.print(f"[red]{error_msg}[/red]")
         click.echo(error_msg, err=True)  # Also output plain text for testing
         return 1
     except ValueError as e:
         error_msg = f"Error: {e}"
-        console.print(f"[red]{error_msg}[/red]", err=True)
+        console.print(f"[red]{error_msg}[/red]")
         click.echo(error_msg, err=True)
         return 1
     except PermissionError as e:
         error_msg = f"Error: {e}"
-        console.print(f"[red]{error_msg}[/red]", err=True)
+        console.print(f"[red]{error_msg}[/red]")
         click.echo(error_msg, err=True)
         return 1
     except ImportError as e:
         error_msg = f"Error: {e}"
-        console.print(f"[red]{error_msg}[/red]", err=True)
-        console.print("[yellow]Hint: Install faster-whisper with: pip install faster-whisper[/yellow]", err=True)
+        console.print(f"[red]{error_msg}[/red]")
+        console.print("[yellow]Hint: Install faster-whisper with: pip install faster-whisper[/yellow]")
         click.echo(error_msg, err=True)
         click.echo("Hint: Install faster-whisper with: pip install faster-whisper", err=True)
         return 1
     except RuntimeError as e:
         error_msg = f"Error: {e}"
-        console.print(f"[red]{error_msg}[/red]", err=True)
+        console.print(f"[red]{error_msg}[/red]")
         click.echo(error_msg, err=True)
         return 1
     except KeyboardInterrupt:
         error_msg = "Transcription interrupted by user"
-        console.print(f"\n[yellow]{error_msg}[/yellow]", err=True)
+        console.print(f"\n[yellow]{error_msg}[/yellow]")
         click.echo(error_msg, err=True)
         return 1
     except Exception as e:
         error_msg = f"Unexpected error: {e}"
-        console.print(f"[red]{error_msg}[/red]", err=True)
+        console.print(f"[red]{error_msg}[/red]")
         click.echo(error_msg, err=True)
         if verbose:
             import traceback
             trace = traceback.format_exc()
-            console.print(f"[dim]{trace}[/dim]", err=True)
+            console.print(f"[dim]{trace}[/dim]")
             click.echo(trace, err=True)
         return 1
 

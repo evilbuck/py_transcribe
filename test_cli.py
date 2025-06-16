@@ -165,6 +165,113 @@ class TestCLI(unittest.TestCase):
         # Check output file was created (main functionality test)
         self.assertTrue(self.temp_output.exists())
 
+    @unittest.skipUnless(Path("assets/nih_3min.mp3").exists(), "Test audio file not available")
+    def test_max_duration_option(self):
+        """Test CLI with max-duration option"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+
+        result = self.runner.invoke(main, [
+            str(self.test_audio_file),
+            '-o', str(self.temp_output),
+            '--model', 'tiny',
+            '--max-duration', '1'
+        ])
+
+        self.assertEqual(result.exit_code, 0, f"Max duration option failed with exit code {result.exit_code}")
+        
+        # Check output file was created
+        self.assertTrue(self.temp_output.exists())
+        
+        # Check output file has content (should be less since only 1 minute processed)
+        with open(self.temp_output, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            self.assertGreater(len(content), 0)
+
+    def test_max_duration_validation(self):
+        """Test CLI with invalid max-duration values"""
+        if self.test_audio_file.exists():
+            # Test negative value
+            result = self.runner.invoke(main, [
+                str(self.test_audio_file),
+                '-o', str(self.temp_output),
+                '--max-duration', '-1'
+            ])
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("Invalid value", result.output)
+            
+            # Test zero value
+            result = self.runner.invoke(main, [
+                str(self.test_audio_file),
+                '-o', str(self.temp_output),
+                '--max-duration', '0'
+            ])
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("Invalid value", result.output)
+
+    def test_help_includes_max_duration(self):
+        """Test that help text includes max-duration option"""
+        result = self.runner.invoke(main, ['--help'])
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("--max-duration", result.output)
+        self.assertIn("Limit transcription to first N minutes", result.output)
+        self.assertIn("--start-time", result.output)
+        self.assertIn("--end-time", result.output)
+
+    @unittest.skipUnless(Path("assets/nih_3min.mp3").exists(), "Test audio file not available")
+    def test_start_end_time_options(self):
+        """Test CLI with start-time and end-time options"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+
+        result = self.runner.invoke(main, [
+            str(self.test_audio_file),
+            '-o', str(self.temp_output),
+            '--model', 'tiny',
+            '--start-time', '30',
+            '--end-time', '90'
+        ])
+
+        self.assertEqual(result.exit_code, 0, f"Start/end time options failed with exit code {result.exit_code}")
+        
+        # Check output file was created
+        self.assertTrue(self.temp_output.exists())
+        
+        # Check output file has content
+        with open(self.temp_output, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            self.assertGreater(len(content), 0)
+
+    def test_conflicting_time_options(self):
+        """Test CLI with conflicting time options"""
+        if self.test_audio_file.exists():
+            # Test max-duration with start-time
+            result = self.runner.invoke(main, [
+                str(self.test_audio_file),
+                '-o', str(self.temp_output),
+                '--max-duration', '2',
+                '--start-time', '30'
+            ])
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn("cannot be used with", result.output)
+
+    def test_invalid_time_range(self):
+        """Test CLI with invalid time range"""
+        if self.test_audio_file.exists():
+            # Test start-time >= end-time
+            result = self.runner.invoke(main, [
+                str(self.test_audio_file),
+                '-o', str(self.temp_output),
+                '--start-time', '90',
+                '--end-time', '30'
+            ])
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn("must be less than", result.output)
+
     def test_case_insensitive_options(self):
         """Test that options are case insensitive"""
         if self.test_audio_file.exists():

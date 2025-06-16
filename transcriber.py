@@ -153,7 +153,10 @@ class AudioTranscriber:
         self, 
         input_path: str, 
         output_path: str, 
-        progress_callback: Optional[Callable[[float, int, float], None]] = None
+        progress_callback: Optional[Callable[[float, int, float], None]] = None,
+        max_duration_minutes: Optional[int] = None,
+        start_time_seconds: Optional[float] = None,
+        end_time_seconds: Optional[float] = None
     ) -> Dict[str, Any]:
         """
         Transcribe audio file to text
@@ -163,6 +166,9 @@ class AudioTranscriber:
             output_path: Path to output text file
             progress_callback: Optional callback function for progress updates
                               Called with (progress_percentage, segment_count, elapsed_time)
+            max_duration_minutes: Optional limit transcription to first N minutes
+            start_time_seconds: Optional start time in seconds
+            end_time_seconds: Optional end time in seconds
         
         Returns:
             Dictionary with transcription results:
@@ -189,13 +195,27 @@ class AudioTranscriber:
         # Start transcription
         start_time = time.time()
         
+        # Prepare transcription parameters
+        transcribe_kwargs = {
+            'beam_size': 5,
+            'vad_filter': True,
+            'vad_parameters': dict(min_silence_duration_ms=1000),
+            'temperature': 0.0
+        }
+        
+        # Add time limiting if specified
+        if max_duration_minutes is not None:
+            clip_end_seconds = max_duration_minutes * 60
+            transcribe_kwargs['clip_timestamps'] = f"0,{clip_end_seconds}"
+        elif start_time_seconds is not None or end_time_seconds is not None:
+            start_time = start_time_seconds or 0
+            end_time = end_time_seconds or audio_duration
+            transcribe_kwargs['clip_timestamps'] = f"{start_time},{end_time}"
+        
         # Use simple, reliable parameters
         segments, info = self.model.transcribe(
             str(input_file),
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=1000),
-            temperature=0.0
+            **transcribe_kwargs
         )
         
         # Write transcription to file with progress tracking

@@ -29,10 +29,12 @@ python transcribe.py <input_file> -o <output_file> [OPTIONS]
 ```
 
 Required arguments:
+
 - `input_file`: Path to audio file
 - `-o, --output`: Output text file path
 
 Optional arguments:
+
 - `--model`: Whisper model size (tiny/base/small/medium/large), defaults to 'base'
 - `--device`: Force specific device (auto/cpu/cuda/mps), defaults to 'auto'
 - `--compute-type`: Force specific compute type (auto/float32/float16/int8/int8_float16), defaults to 'auto'
@@ -54,6 +56,7 @@ Optional arguments:
 ## Dependencies
 
 Core dependencies:
+
 - `faster-whisper>=1.0.0`: Core transcription engine
 - `click>=8.0.0`: Command line interface framework
 - `rich>=13.0.0`: Beautiful terminal output and progress bars
@@ -72,20 +75,22 @@ The tool should handle common audio formats (mp3, wav, m4a) and process files of
 ## Testing
 
 Run comprehensive tests:
+
 ```bash
 python test_all.py
 ```
 
 Individual test modules:
+
 ```bash
 python test_utils.py      # Utility function tests
-python test_transcriber.py # Core transcription tests  
+python test_transcriber.py # Core transcription tests
 python test_cli.py        # CLI interface tests
 ```
 
 ## Development Workflow Memories
 
-- add user docs after adding a feature in docs/*.md
+- add user docs after adding a feature in docs/\*.md
 - take it step by step. Generate tests for planned tasks. Use the tests to iterate during each step. Code like a human that iteratively builds up functionality and tests piece by piece.
 - create a plan and present it and/or tasks to get approval before writing or modifying files.
 - use the assets/testing-file for testing with real files
@@ -95,7 +100,15 @@ python test_cli.py        # CLI interface tests
 ## Code Structure
 
 The modular architecture provides:
+
 - **Separation of concerns**: CLI logic separate from transcription logic
 - **Testability**: Each module can be tested independently
 - **Extensibility**: Easy to add new CLI features or alternative interfaces
 - **Maintainability**: Clean, focused modules with clear responsibilities
+
+## Debugging and Logging
+
+- use a configuration flag to debug
+- utilize logger library and log levels to control debug
+- do not add debug logging that needs to be removed later. use the logger and logging levels
+

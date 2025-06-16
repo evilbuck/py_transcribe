@@ -148,6 +148,110 @@ class TestAudioTranscriber(unittest.TestCase):
         # Verify progress callback was called
         self.assertGreater(len(progress_calls), 0)
 
+    @unittest.skipUnless(Path("assets/nih_3min.mp3").exists(), "Test audio file not available")
+    def test_max_duration_transcription(self):
+        """Test transcription with max duration limit"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+
+        # Test with 1 minute limit on 3-minute file
+        result = self.transcriber.transcribe_file(
+            str(self.test_audio_file),
+            str(self.temp_output),
+            max_duration_minutes=1
+        )
+
+        # Verify result structure
+        expected_keys = {
+            'language', 'language_probability', 'audio_duration',
+            'processing_time', 'speed_ratio', 'segment_count', 'output_path'
+        }
+        self.assertEqual(set(result.keys()), expected_keys)
+
+        # Audio duration should still be the full file duration
+        self.assertGreater(result['audio_duration'], 170)
+        self.assertLess(result['audio_duration'], 190)
+
+        # Verify output file was created and has content
+        self.assertTrue(self.temp_output.exists())
+        with open(self.temp_output, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            self.assertGreater(len(content), 0)
+
+        # Processing should be faster since we only processed 1 minute
+        self.assertGreater(result['processing_time'], 0)
+
+    def test_max_duration_parameter_validation(self):
+        """Test max_duration parameter validation in transcribe_file"""
+        # Test with valid max_duration
+        if self.test_audio_file.exists():
+            try:
+                from faster_whisper import WhisperModel
+                # This should not raise an exception
+                result = self.transcriber.transcribe_file(
+                    str(self.test_audio_file),
+                    str(self.temp_output),
+                    max_duration_minutes=2
+                )
+                # Verify the basic structure
+                self.assertIn('output_path', result)
+            except ImportError:
+                self.skipTest("faster-whisper not installed")
+
+    @unittest.skipUnless(Path("assets/nih_3min.mp3").exists(), "Test audio file not available")
+    def test_start_end_time_transcription(self):
+        """Test transcription with start and end time"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+
+        # Test with 30-90 second range
+        result = self.transcriber.transcribe_file(
+            str(self.test_audio_file),
+            str(self.temp_output),
+            start_time_seconds=30,
+            end_time_seconds=90
+        )
+
+        # Verify result structure
+        expected_keys = {
+            'language', 'language_probability', 'audio_duration',
+            'processing_time', 'speed_ratio', 'segment_count', 'output_path'
+        }
+        self.assertEqual(set(result.keys()), expected_keys)
+
+        # Audio duration should still be the full file duration
+        self.assertGreater(result['audio_duration'], 170)
+        self.assertLess(result['audio_duration'], 190)
+
+        # Verify output file was created and has content
+        self.assertTrue(self.temp_output.exists())
+        with open(self.temp_output, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            self.assertGreater(len(content), 0)
+
+    def test_start_time_only_transcription(self):
+        """Test transcription with only start time"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+
+        # Test starting from 60 seconds
+        if self.test_audio_file.exists():
+            result = self.transcriber.transcribe_file(
+                str(self.test_audio_file),
+                str(self.temp_output),
+                start_time_seconds=60
+            )
+            
+            # Verify basic structure
+            self.assertIn('output_path', result)
+            self.assertTrue(self.temp_output.exists())
+
     def test_error_handling_invalid_audio_file(self):
         """Test error handling with invalid audio file"""
         # Create a text file with audio extension
