@@ -55,3 +55,5 @@ The tool should handle common audio formats (mp3, wav, m4a) and process files of
 - take it step by step. Generate tests for planned tasks. Use the tests to iterate during each step. Code like a human that iteratively builds up functionality and tests piece by piece.
 - create a plan and present it and/or tasks to get approval before writing or modifying files.
 - use the assets/testing-file for testing with real files
+- Always test every feature with unit tests using unittest. Use the tests to validate the work. Iterate until tests pass. Verify all tests at completion of a task. Always be green unless there is a known, purposeful breakage that can't be avoided until the following step
+- After completion of a task, generate a descriptive commit message and commit the changes.
