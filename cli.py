@@ -113,7 +113,7 @@ class ProgressTracker:
 @click.option(
     '--max-duration',
     type=click.IntRange(min=1),
-    help='Limit transcription to first N minutes of audio'
+    help='Limit transcription to N minutes (from start or --start-time)'
 )
 @click.option(
     '--start-time',
@@ -135,11 +135,16 @@ def main(input_file, output, model, device, compute_type, verbose, quiet, max_du
     Supported audio formats: MP3, WAV, M4A, OGG, FLAC, AAC, WMA
     """
     # Validate time parameter combinations first, before any operations
-    if max_duration and (start_time is not None or end_time is not None):
-        error_msg = "Error: --max-duration cannot be used with --start-time or --end-time"
+    if max_duration and end_time is not None:
+        error_msg = "Error: --max-duration cannot be used with --end-time"
         console.print(f"[red]{error_msg}[/red]")
         click.echo(error_msg, err=True)
         sys.exit(1)
+    
+    # Calculate end time if start-time and max-duration are both provided
+    if start_time is not None and max_duration is not None:
+        calculated_end_time = start_time + (max_duration * 60)
+        end_time = calculated_end_time
     
     if start_time is not None and end_time is not None and start_time >= end_time:
         error_msg = "Error: --start-time must be less than --end-time"

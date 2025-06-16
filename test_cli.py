@@ -249,15 +249,41 @@ class TestCLI(unittest.TestCase):
     def test_conflicting_time_options(self):
         """Test CLI with conflicting time options"""
         if self.test_audio_file.exists():
-            # Test max-duration with start-time
+            # Test max-duration with end-time (should fail)
             result = self.runner.invoke(main, [
                 str(self.test_audio_file),
                 '-o', str(self.temp_output),
                 '--max-duration', '2',
-                '--start-time', '30'
+                '--end-time', '90'
             ])
             self.assertEqual(result.exit_code, 1)
             self.assertIn("cannot be used with", result.output)
+
+    @unittest.skipUnless(Path("assets/nih_3min.mp3").exists(), "Test audio file not available")
+    def test_start_time_with_max_duration(self):
+        """Test CLI with start-time and max-duration combination"""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            self.skipTest("faster-whisper not installed")
+
+        result = self.runner.invoke(main, [
+            str(self.test_audio_file),
+            '-o', str(self.temp_output),
+            '--model', 'tiny',
+            '--start-time', '30',
+            '--max-duration', '2'
+        ])
+
+        self.assertEqual(result.exit_code, 0, f"Start time + max duration failed with exit code {result.exit_code}")
+        
+        # Check output file was created
+        self.assertTrue(self.temp_output.exists())
+        
+        # Check output file has content (should be 2 minutes starting from 30 seconds)
+        with open(self.temp_output, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            self.assertGreater(len(content), 0)
 
     def test_invalid_time_range(self):
         """Test CLI with invalid time range"""
